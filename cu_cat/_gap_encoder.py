@@ -301,12 +301,29 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         # Update self.H_dict_ with unique input strings and their activations
         if 'cuml' in self.engine:
             self.H_dict_.update(zip(unq_X.to_arrow(), unq_H.values))
+            self._remember_keys(unq_X)
         else:
             self.H_dict_.update(zip(unq_X, unq_H))
+            self._remember_keys(unq_X)
         if self.rescale_rho:
             # Make update rate per iteration independent of the batch_size
             self.rho_ = self.rho ** (self.batch_size / len(X))
         return unq_X, unq_V, lookup
+
+    def _remember_keys(self, keys) -> None:
+        """Track the keys held in H_dict_ without leaving the device.
+
+        H_dict_ is keyed by pyarrow scalars, so asking it which strings it
+        knows costs one Python-level .as_py() per key. The callers already
+        hold the keys as a cudf.Series or numpy array, so keep a copy in that
+        form and let _add_unseen_keys_to_H_dict test membership in bulk.
+        """
+        prev = getattr(self, "_known_keys_", None)
+        if cudf is not None and isinstance(keys, cudf.Series):
+            self._known_keys_ = keys if prev is None else cudf.concat([prev, keys]).unique()
+        else:
+            arr = np.asarray(keys, dtype=object)
+            self._known_keys_ = arr if prev is None else np.union1d(prev, arr)
 
     def _get_H(self, X: np.array) -> np.array:
         """
@@ -548,8 +565,10 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         if 'cudf' in df_type(unq_X) :
         # if deps.cudf:
             self.H_dict_.update(zip(unq_X.to_arrow(), unq_H))
+            self._remember_keys(unq_X)
         else:
             self.H_dict_.update(zip(unq_X, unq_H))
+            self._remember_keys(unq_X)
         logger.debug(
             f"--GapEncoder Fitting took {(time() - t) / 60:.2f} minutes\n"
         )
@@ -658,13 +677,17 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         Add activations of unseen string categories from X to H_dict.
         """
 
+        known = getattr(self, "_known_keys_", None)
         if 'cudf' in self.Xt_:
-        # if deps.cudf:
-            A = np.array([(item).as_py() for item in self.H_dict_])
-            unseen_X = np.setdiff1d(X.to_arrow(), A, assume_unique=True) 
-            unseen_X = cudf.Series(unseen_X)
+            if known is not None:
+                unseen_X = X[~X.isin(known)]
+            else:  # fitted before key tracking existed
+                A = np.array([(item).as_py() for item in self.H_dict_])
+                unseen_X = cudf.Series(np.setdiff1d(X.to_arrow(), A, assume_unique=True))
         else:
-            unseen_X = np.setdiff1d(X.astype(str), np.array([*self.H_dict_]))
+            if known is None:
+                known = np.array([*self.H_dict_], dtype=object)
+            unseen_X = np.setdiff1d(X.astype(str), known)
         
         if unseen_X.size > 0:
             unseen_V = self.ngrams_count_.transform(unseen_X)
@@ -677,8 +700,10 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
             if 'cudf' in df_type(unseen_X) :
             # if deps.cudf:
                 self.H_dict_.update(zip(unseen_X.to_arrow(), unseen_H.values))
+                self._remember_keys(unseen_X)
             else:
                 self.H_dict_.update(zip(unseen_X, unseen_H))
+                self._remember_keys(unseen_X)
 
     def transform(self, X) -> np.array:
         """
@@ -799,8 +824,10 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         if 'cudf' in df_type(unq_X) :
         # if deps.cudf:
             self.H_dict_.update(zip(unq_X.to_arrow(), unq_H))
+            self._remember_keys(unq_X)
         else:
             self.H_dict_.update(zip(unq_X, unq_H))
+            self._remember_keys(unq_X)
         logger.debug(
             f"--GapEncoder Tranforming took {(time() - t) / 60:.2f} minutes\n"
         )

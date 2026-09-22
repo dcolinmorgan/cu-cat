@@ -306,3 +306,18 @@ def test_unique_lookup_reconstructs_input():
     rebuilt = np.asarray(to_host(unq_X))[np.asarray(to_host(lookup))]
 
     assert list(rebuilt) == values
+
+
+def test_transform_encodes_unseen_categories():
+    """Strings absent from fit still get an encoding, via the tracked keys."""
+    X_fit = pd.DataFrame({"c": ["alpha one", "beta two", "gamma three"] * 8})
+    X_new = pd.DataFrame({"c": ["delta four", "alpha one", "epsilon five"]})
+
+    enc = GapEncoder(n_components=3, max_iter=2, random_state=0, hashing=True)
+    enc.fit(X_fit)
+    out = to_host(enc.transform(X_new))
+
+    assert out.shape == (3, 3)
+    assert np.isfinite(out).all()
+    # the two unseen strings must not collapse onto the same encoding
+    assert not np.allclose(out[0], out[2])
