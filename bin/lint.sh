@@ -18,6 +18,7 @@ flake8 --version
 # Deeper check
 flake8 \
   cu_cat \
+  --exclude='*/site-packages/*,.venv,*/.ipynb_checkpoints/*' \
   --count \
   --select=E9,F63,F7,F82 \
   --ignore=C901,E121,E122,E123,E124,E125,E128,E131,E144,E201,E202,E203,E231,E251,E265,E301,E302,E303,E401,E501,E722,F401,W291,W293,F821,E999 \

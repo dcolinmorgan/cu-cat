@@ -45,24 +45,24 @@ jobs:
 
     - name: Install test dependencies
       run: |
-        python -m venv cu_cat
-        source cu_cat/bin/activate
+        python -m venv .venv
+        source .venv/bin/activate
         python -m pip install --upgrade pip
         python -m pip install -e .[test,dirty-cat]
 
     - name: Lint
       run: |
-        source cu_cat/bin/activate
+        source .venv/bin/activate
         ./bin/lint.sh
 
     - name: Type check
       run: |
-        source cu_cat/bin/activate
+        source .venv/bin/activate
         ./bin/typecheck.sh
 
     - name: Core tests
       run: |
-        source cu_cat/bin/activate
+        source .venv/bin/activate
         ./bin/test-core.sh
 
 
@@ -95,8 +95,8 @@ jobs:
 
     - name: Install test dependencies
       run: |
-        python -m venv cu_cat
-        source cu_cat/bin/activate
+        python -m venv .venv
+        source .venv/bin/activate
         python -m pip install --upgrade pip
         python -m pip install -e .[test,rapids,dirty-cat]
 
@@ -104,22 +104,22 @@ jobs:
     # not a reason to report success.
     - name: Require RAPIDS
       run: |
-        source cu_cat/bin/activate
+        source .venv/bin/activate
         python -c "import cudf, cuml, cupy; print('cudf', cudf.__version__, 'cuml', cuml.__version__)"
 
     - name: Lint
       run: |
-        source cu_cat/bin/activate
+        source .venv/bin/activate
         ./bin/lint.sh
 
     - name: Type check
       run: |
-        source cu_cat/bin/activate
+        source .venv/bin/activate
         ./bin/typecheck.sh
 
     - name: RAPIDS tests
       run: |
-        source cu_cat/bin/activate
+        source .venv/bin/activate
         ./bin/test-rapids.sh
 
   test-build:
