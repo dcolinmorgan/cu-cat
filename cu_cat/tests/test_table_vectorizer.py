@@ -17,7 +17,8 @@ dirty_cat = deps.dirty_cat
 MSG_PANDAS_DEPRECATED_WARNING = "Skip deprecation warning"
 
 requires_dirty_cat = pytest.mark.skipif(
-    dirty_cat is None, reason="dirty_cat not installed"
+    dirty_cat is None or pd.__version__ >= "2.2",
+    reason="dirty_cat not installed or broken on pandas >= 2.2 (deprecated 'H' freq)"
 )
 
 
