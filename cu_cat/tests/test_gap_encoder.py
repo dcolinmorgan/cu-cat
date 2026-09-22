@@ -5,7 +5,7 @@ from sklearn.model_selection import train_test_split
 
 from cu_cat import GapEncoder, TableVectorizer
 from cu_cat.datasets._fetching import fetch_midwest_survey
-from cu_cat.tests.utils import generate_data
+from cu_cat.tests.utils import generate_data, to_host
 
 MODULES = [pd]
 
@@ -61,7 +61,9 @@ def test_analyzer(
     # s2 = encoder.score(X)
 
     # Test inequality between the word and char analyzers output:
-    np.testing.assert_raises(AssertionError, np.testing.assert_array_equal, y1, y2)
+    np.testing.assert_raises(
+        AssertionError, np.testing.assert_array_equal, to_host(y1), to_host(y2)
+    )
     # np.testing.assert_raises(AssertionError, np.testing.assert_array_equal, s1, s2)
 
 
@@ -97,7 +99,7 @@ def test_gap_encoder(
 
     # Test L1-norm of topics W.
     for col_enc in encoder.fitted_models_:
-        l1_norm_W = np.abs(col_enc.W_).sum(axis=1)
+        l1_norm_W = np.abs(to_host(col_enc.W_)).sum(axis=1)
         np.testing.assert_array_almost_equal(l1_norm_W, np.ones(n_components))
 
     # Test same seed return the same output
@@ -111,7 +113,9 @@ def test_gap_encoder(
     )
     encoder.fit(X)
     y2 = encoder.transform(X)
-    np.testing.assert_array_equal(y, y2)
+    # GPU reductions are not bitwise reproducible across runs, so same-seed
+    # equality is checked to tight tolerance rather than exactly.
+    np.testing.assert_allclose(to_host(y), to_host(y2), rtol=1e-10, atol=1e-10)
 
 
 def test_get_feature_names_out(n_samples=70):

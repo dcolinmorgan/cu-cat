@@ -4,6 +4,14 @@ import numpy as np
 from numpy.typing import NDArray
 import pandas as pd
 
+def to_host(a):
+    """Return `a` as a host numpy array (cupy/cudf outputs need an explicit copy)."""
+    for attr in ("get", "to_numpy", "to_pandas"):
+        if hasattr(a, attr):
+            return np.asarray(getattr(a, attr)())
+    return np.asarray(a)
+
+
 def generate_data(
     n_samples,
     as_list=False,
