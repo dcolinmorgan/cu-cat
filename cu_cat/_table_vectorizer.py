@@ -652,7 +652,7 @@ class TableVectorizer(ColumnTransformer):
                 known_categories = dtype.categories # type: ignore
                 new_categories = pd.unique(X[col])	
                 dtype = pd.CategoricalDtype(  # type: ignore
-                    categories=known_categories.union(new_categories)	
+                    categories=known_categories.union(new_categories)  # type: ignore[arg-type]
                 )	
                 self.types_[col] = dtype	
             X.loc[:, col] = X[col].astype(dtype)
@@ -918,7 +918,7 @@ class TableVectorizer(ColumnTransformer):
                     continue
                 if trans == "passthrough":
                     if all(isinstance(col, int) for col in cols):
-                        cols = [self.columns_[i] for i in cols]
+                        cols = [self.columns_[i] for i in cols]  # type: ignore[misc,index]
                     cols = [str(r) for r in cols]
                     all_trans_feature_names.extend(cols)
 
