@@ -286,3 +286,23 @@ def test_plan_updates_never_below_batch_size():
     fits, chunk = enc._plan_updates(sh=500_000, sw=4096)
     assert not fits
     assert chunk == enc.batch_size
+
+
+def test_unique_lookup_reconstructs_input():
+    """unq_X[lookup] must rebuild the input on every device.
+
+    Guards the ordering contract between the unique values and the inverse
+    index: they are consumed together by the batched update path, so a
+    mismatch there silently encodes rows against the wrong topics.
+    """
+    from cu_cat._dep_manager import deps
+    from cu_cat._gap_encoder import _unique_strings
+
+    # deliberately unsorted, with repeats
+    values = ["beta", "alpha", "gamma", "alpha", "beta", "beta", "delta"]
+    engine = "cuml" if deps.cudf else "sklearn"
+
+    unq_X, lookup = _unique_strings(pd.Series(values), engine, return_lookup=True)
+    rebuilt = np.asarray(to_host(unq_X))[np.asarray(to_host(lookup))]
+
+    assert list(rebuilt) == values

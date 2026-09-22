@@ -106,10 +106,16 @@ def _unique_strings(X, engine, return_lookup=False):
     """
     X, _ = make_safe_gpu_dataframes(X, None, engine)
     if 'cudf' in str(getmodule(X)):
-        unq_X = X.unique()
         if not return_lookup:
-            return unq_X, None
-        _, lookup = np.unique(X.to_pandas(), return_inverse=True)
+            return X.unique(), None
+        # factorize returns the uniques and their inverse index from a single
+        # device pass. Pairing X.unique() with np.unique(X.to_pandas()) instead
+        # would copy every string to the host *and* mismatch: cudf returns
+        # uniques in order of appearance while np.unique sorts them, so the
+        # lookup would index a different ordering.
+        codes, uniques = X.factorize()
+        unq_X = uniques if isinstance(uniques, cudf.Series) else cudf.Series(uniques)
+        lookup = codes.values if hasattr(codes, "values") else codes
         return unq_X, lookup
     if return_lookup:
         return np.unique(X.astype(str), return_inverse=True)
@@ -504,12 +510,14 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                         logger.debug(f"force numpy iterative fit")
                     except:
                         pass
+                # Same vectorised kernels as the whole-matrix path, applied one
+                # chunk at a time. The per-row variants below are ~1000x slower
+                # on GPU: they launch a handful of tiny kernels per row.
                 for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=chunk_rows)):
                     if i == n_batch - 1:
                         W_last = self.W_.copy()
                     # Update activations unq_H
-                    unq_H[unq_idx] = _multiplicative_update_h(
-                        self,
+                    unq_H[unq_idx] = _multiplicative_update_h_smallfast(
                         unq_V[unq_idx],
                         self.W_,
                         unq_H[unq_idx],
@@ -520,8 +528,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                         gamma_scale_prior=self.gamma_scale_prior,
                     )
                     # Update the topics self.W_
-                    _multiplicative_update_w(
-                        self,
+                    _multiplicative_update_w_smallfast(
                         unq_V[idx],
                         self.W_,
                         self.A_,
@@ -779,8 +786,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
             #     logger.debug(f"force numpy transform")
             for slc in gen_batches(n=unq_H.shape[0], batch_size=chunk_rows):
                 # Given the learnt topics W, optimize H to fit V = HW
-                unq_H[slc] = _multiplicative_update_h(
-                    self,
+                unq_H[slc] = _multiplicative_update_h_smallfast(
                     unq_V[slc],
                     self.W_,
                     unq_H[slc],
@@ -1518,7 +1524,10 @@ def batch_lookup(
     Make batches of the lookup array.
     """
     len_iter = len(lookup)
+    # Keep the gather on-device: a host index array would force a copy per
+    # batch, which is what made the batched path host-bound.
+    xp = cp if (cp is not None and isinstance(lookup, cp.ndarray)) else np
     for idx in range(0, len_iter, n):
         indices = lookup[slice(idx, min(idx + n, len_iter))]
-        unq_indices = np.unique(indices)
+        unq_indices = xp.unique(indices)
         yield unq_indices, indices
