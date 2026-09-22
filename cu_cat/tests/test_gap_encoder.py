@@ -252,3 +252,37 @@ def test_partial_fit_rejects_column_count_change():
     wider.columns = ["a", "b"]  # cudf rejects duplicate names before our check
     with pytest.raises(ValueError, match="columns changed"):
         enc.partial_fit(wider)
+
+
+def test_plan_updates_chunks_when_over_budget():
+    """The planner falls back to a memory-derived chunk, not a fixed batch."""
+    from cu_cat._gap_encoder import GapEncoderColumn
+
+    enc = GapEncoderColumn(n_components=10, batch_size=128)
+    enc.engine = "cuml"
+    enc.gmem = 1000  # MB
+    enc.byte_lim = 8
+
+    # 1000 unique x 4096 vocab x 8B x 3 copies = ~98 MB -> fits
+    fits, chunk = enc._plan_updates(sh=1000, sw=4096)
+    assert fits and chunk == 1000
+
+    # 1e6 unique x 4096 vocab x 8B x 3 copies = ~98 GB -> must chunk
+    fits, chunk = enc._plan_updates(sh=1_000_000, sw=4096)
+    assert not fits
+    assert chunk >= enc.batch_size          # never worse than the old fixed size
+    assert chunk < 1_000_000
+    # the chunk's dense term must sit inside the budget
+    assert (enc.byte_lim * chunk * 4096 * enc._DENSE_COPIES) / 1e6 < enc.gmem
+
+
+def test_plan_updates_never_below_batch_size():
+    """A tiny budget still yields a usable chunk rather than zero rows."""
+    from cu_cat._gap_encoder import GapEncoderColumn
+
+    enc = GapEncoderColumn(n_components=10, batch_size=128)
+    enc.engine = "cuml"
+    enc.gmem = 1  # MB: absurdly small
+    fits, chunk = enc._plan_updates(sh=500_000, sw=4096)
+    assert not fits
+    assert chunk == enc.batch_size

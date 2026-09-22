@@ -51,6 +51,16 @@ for chunk in pd.read_csv("huge.csv", chunksize=1_000_000):
 encoded = enc.transform(df[["dirty_column"]])
 ```
 
+**Narrow the hash width when cardinality is high.** The dominant GPU allocation during fitting is the dense `H @ W` term, which costs `n_unique * hashing_n_features * 8` bytes with a few copies live at once. It scales with the number of *distinct* strings and with the vocabulary width, not with row count, so halving the width halves the peak. Measured on a Colab T4 (15 GB), 1M rows over 200,000 distinct strings:
+
+| `hashing_n_features` | fit time |
+|---|---|
+| 4096 (default) | does not fit; falls back to chunked updates and becomes impractically slow |
+| 1024 | 17.2 s |
+| 512 | 14.1 s |
+
+As a rule of thumb, keep `n_unique * hashing_n_features * 24` bytes under your free GPU memory. If you exceed it, cu-cat automatically chunks the updates to stay within budget rather than raising an out-of-memory error, but narrowing the width is far faster than relying on that fallback.
+
 **`hashing=True` for unbounded cardinality.** The default `CountVectorizer` learns a vocabulary, so it must see all unique strings at once and it freezes that vocabulary on the first `partial_fit` chunk. `HashingVectorizer` (`hashing=True`) is stateless with a fixed `hashing_n_features` width, so it needs no vocabulary pass and stays a constant size no matter how many distinct strings arrive. That makes it the right choice when the number of *distinct* values, not the number of rows, is what exceeds GPU memory.
 
 GPU = colab T4 + 15gb mem and colab CPU + 12gb memory

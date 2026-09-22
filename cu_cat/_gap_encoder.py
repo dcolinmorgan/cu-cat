@@ -390,6 +390,42 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         del X
         return self._fit_topics(unq_X, unq_V, lookup, n_rows, t)
 
+    # Ht @ W is dense (n_rows_in_step * vocab). The update keeps roughly this
+    # many copies of it alive at once: the product, its reciprocal, and the
+    # R/T intermediate.
+    _DENSE_COPIES = 3
+
+    def _dense_budget_mb(self) -> float:
+        """Memory available for the dense term, in MB.
+
+        gmem comes from nvidia-smi and is already MB; smem comes from psutil
+        and is bytes.
+        """
+        return self.gmem if self.engine == 'cuml' else self.smem / 1e6
+
+    def _plan_updates(self, sh: int, sw: int) -> Tuple[bool, int]:
+        """Decide whether the whole matrix fits, else how many rows per chunk.
+
+        Returns (fits_at_once, chunk_rows). Chunking by a memory-derived size
+        rather than the fixed batch_size keeps the dense term inside the
+        budget without falling back to tiny batches, which are dramatically
+        slower on GPU.
+        """
+        per_row_mb = (self.byte_lim * sw) / 1e6
+        budget = self._dense_budget_mb()
+        needed = per_row_mb * sh * self._DENSE_COPIES
+        if needed < budget:
+            return True, sh
+        # Spend half the budget on the dense term, leaving room for W/A/B,
+        # the sparse counts and allocator fragmentation.
+        chunk = int((budget * 0.5) / (per_row_mb * self._DENSE_COPIES)) if per_row_mb else sh
+        chunk = max(self.batch_size, min(chunk, sh))
+        logger.info(
+            f"dense term needs ~{needed:.0f} MB > budget {budget:.0f} MB; "
+            f"chunking {sh} rows at {chunk} per step"
+        )
+        return False, chunk
+
     def _fit_topics(self, unq_X, unq_V, lookup, n_rows, t=None):
         """Run the multiplicative updates for topics W given counts unq_V.
 
@@ -411,12 +447,9 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         # n_unique * vocab * 8 bytes (several copies). Only take it when that
         # fits; otherwise go straight to the batched loop, whose dense term is
         # bounded by batch_size * vocab instead.
-        budget = self.gmem if self.engine == 'cuml' else self.smem
-        fits_at_once = ((self.byte_lim * sh * sw) / 1e6) < budget
-        logger.info(
-            f"fit needs ~{(self.byte_lim*sh*sw)/1e6:.0f} MB dense, budget {budget} MB "
-            f"-> {'whole-matrix' if fits_at_once else 'batched'} updates"
-        )
+        fits_at_once, chunk_rows = self._plan_updates(sh, sw)
+        if not fits_at_once:
+            n_batch = (n_rows - 1) // chunk_rows + 1
         W_last = self.W_.copy()  # batched path only refreshes this on its last batch
         for n_iter_ in range(self.max_iter):
             if fits_at_once and self.engine == 'cuml':  # small fast fit
@@ -471,7 +504,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                         logger.debug(f"force numpy iterative fit")
                     except:
                         pass
-                for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=self.batch_size)):
+                for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=chunk_rows)):
                     if i == n_batch - 1:
                         W_last = self.W_.copy()
                     # Update activations unq_H
@@ -682,8 +715,8 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         sw = max(self.W_.shape)
         
         # Loop over batches
-        logger.info(f"req gpu mem for transform =  `{(self.byte_lim*sh*sw)/1e6}`, free sys gmem = `{self.gmem}`")
-        if ((self.byte_lim*sh*sw)/1e6)<self.gmem:  # or ((self.byte_lim*sh*sw)/1e6)<self.smem:  # small fast transform gpu or cpu depending on input var types
+        fits_at_once, chunk_rows = self._plan_updates(sh, sw)
+        if fits_at_once:
             logger.debug(f"transforming smallfast-wise")
             W_type = df_type(self.W_)
             if 'cudf' in W_type and self.engine =='cuml':
@@ -692,7 +725,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
             elif 'cudf' not in W_type and 'cupy' not in W_type and self.engine =='cuml':
                 self.W_ = cp.array(self.W_); self.B_ = cp.array(self.B_); self.A_ = cp.array(self.A_)
                 logger.debug(f"moving to gpu for mat_mul transform")
-            elif self.engine !='cuml' and ((self.byte_lim*sh*sw)/1e6)<self.smem:  # small fast on cpu increases speed too
+            elif self.engine !='cuml':  # small fast on cpu increases speed too
                 try:
                     self.W_ = self.W_.get(); self.B_ = self.B_.get(); self.A_ = self.A_.get()
                     logger.debug(f"performing mat_mul speed trick on cpu for transform")
@@ -708,7 +741,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                     gamma_shape_prior=self.gamma_shape_prior,
                     gamma_scale_prior=self.gamma_scale_prior,
                 )
-        if ((self.byte_lim*sh*sw)/1e6)>self.gmem and ((self.byte_lim*sh*sw)/1e6)>self.smem:
+        else:
             W_type = df_type(self.W_)
             if self.engine =='cuml' and ((self.byte_lim*sh)/1e6)<self.gmem and ((self.byte_lim*sw)/1e6)<self.gmem:  # standard loop but still gpu
                 try:
@@ -744,7 +777,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
             #     except:
             #         pass
             #     logger.debug(f"force numpy transform")
-            for slc in gen_batches(n=unq_H.shape[0], batch_size=self.batch_size):
+            for slc in gen_batches(n=unq_H.shape[0], batch_size=chunk_rows):
                 # Given the learnt topics W, optimize H to fit V = HW
                 unq_H[slc] = _multiplicative_update_h(
                     self,
