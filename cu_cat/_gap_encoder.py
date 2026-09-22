@@ -40,7 +40,7 @@ from sklearn.utils.fixes import _object_dtype_isnan
 from sklearn.utils.validation import check_is_fitted
 from sklearn.decomposition._nmf import _beta_divergence
 
-from ._utils import check_input, parse_version, get_gpu_memory, get_sys_memory, df_type#, make_math_df
+from ._utils import check_input, parse_version, get_gpu_memory, get_sys_memory, df_type
 
 
 from ._dep_manager import deps
@@ -76,11 +76,17 @@ def make_safe_gpu_dataframes(X, y, engine):
         assert cudf is not None
         new_kwargs = {}
         kwargs = {'X': X, 'y': y}
+        want_cpu = engine in ["pandas", "sklearn", "cpu"]
         for key, value in kwargs.items():
-            if isinstance(value, cudf.DataFrame) and engine in ["pandas", "sklearn", "cpu"]:
+            if value is None:
+                new_kwargs[key] = value
+            elif want_cpu and isinstance(value, (cudf.DataFrame, cudf.Series)):
                 new_kwargs[key] = value.to_pandas()
-            elif isinstance(value, pd.DataFrame) and engine in ["cuml", "cuda", "gpu"]:
+            elif not want_cpu and isinstance(value, (pd.DataFrame, pd.Series)):
                 new_kwargs[key] = cudf.from_pandas(value)
+            elif not want_cpu and isinstance(value, np.ndarray) and value.ndim == 1:
+                # GapEncoderColumn is handed raw 1-d arrays; cuml needs a cudf.Series
+                new_kwargs[key] = cudf.Series(value)
             else:
                 new_kwargs[key] = value
         return new_kwargs['X'], new_kwargs['y']
@@ -89,6 +95,31 @@ def make_safe_gpu_dataframes(X, y, engine):
 
 EngineConcrete = Literal['cuml', 'sklearn']
 Engine = Literal[EngineConcrete, "auto"]
+
+
+def _unique_strings(X, engine, return_lookup=False):
+    """Unique values of X, on whichever device `engine` wants them.
+
+    Returns (unique_values, lookup) where lookup is the inverse index into the
+    unique values (None unless requested). Keeping this in one place means the
+    cudf and numpy paths cannot drift apart.
+    """
+    X, _ = make_safe_gpu_dataframes(X, None, engine)
+    if 'cudf' in str(getmodule(X)):
+        if not return_lookup:
+            return X.unique(), None
+        # factorize returns the uniques and their inverse index from a single
+        # device pass. Pairing X.unique() with np.unique(X.to_pandas()) instead
+        # would copy every string to the host *and* mismatch: cudf returns
+        # uniques in order of appearance while np.unique sorts them, so the
+        # lookup would index a different ordering.
+        codes, uniques = X.factorize()
+        unq_X = uniques if isinstance(uniques, cudf.Series) else cudf.Series(uniques)
+        lookup = codes.values if hasattr(codes, "values") else codes
+        return unq_X, lookup
+    if return_lookup:
+        return np.unique(X.astype(str), return_inverse=True)
+    return np.unique(X.astype(str)), None
 
 
 def resolve_engine(
@@ -120,7 +151,7 @@ def resolve_engine(
         f"but received: {engine} :: {type(engine)}"
     )
 
-class GapEncoderColumn(BaseEstimator, TransformerMixin):
+class GapEncoderColumn(TransformerMixin, BaseEstimator):
 
     """See GapEncoder's docstring."""
 
@@ -200,6 +231,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         the topics W.
         """
         self.Xt_ = df_type(X)
+        # X = X[X.str.len() >3]  # cudf CV has trouble with shorter strings
         # if deps.cudf and parse_version(cuml.__version__) > parse_version("23.04"):
             # X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
         # cuml.set_global_output_type('cupy')
@@ -233,13 +265,15 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         #     X = X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
         # X.convert_dtypes()
         # Build the n-grams counts matrix unq_V on unique elements of X
-        X, y = make_safe_gpu_dataframes(X, None, self.engine)
-        if 'cudf' not in str(getmodule(X)) and 'cuml' not in self.engine:
-            unq_X, lookup = np.unique(X.astype(str), return_inverse=True)
-        elif 'cudf' in str(getmodule(X)) and 'cuml' in self.engine:
-            unq_X = X.unique()
-            tmp, lookup = np.unique(X.to_arrow(), return_inverse=True)
-        unq_V = self.ngrams_count_.fit_transform(unq_X)
+        unq_X, lookup = _unique_strings(X, self.engine, return_lookup=True)
+        try:
+            unq_V = self.ngrams_count_.fit_transform(unq_X)
+        except (IndexError, RuntimeError):
+            # libcudf's generate_ngrams needs every string to have at least
+            # ngram_range[1] characters. Pad rather than filter: dropping rows
+            # here desynchronises `lookup`, which indexes the full input.
+            unq_X = unq_X.str.rjust(self.ngram_range[1], '0')
+            unq_V = self.ngrams_count_.fit_transform(unq_X)
         if self.add_words:  # Add word counts to unq_V
             unq_V2 = self.word_count_.fit_transform(unq_X)
             unq_V = sparse.hstack((unq_V, unq_V2), format="csr")
@@ -259,7 +293,9 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         _, self.n_vocab = unq_V.shape
         # Init the topics W given the n-grams counts V
 
-        self.W_, self.A_, self.B_ = self._init_w(unq_V[lookup], X)
+        # NB: _init_w only needs self.n_vocab. Passing unq_V[lookup] used to
+        # expand the unique-row count matrix to full row count and throw it away.
+        self.W_, self.A_, self.B_ = self._init_w()
         # Init the activations unq_H of each unique input string
         unq_H = _rescale_h(self, unq_V, np.ones((len(unq_X), self.n_components)))
         # Update self.H_dict_ with unique input strings and their activations
@@ -299,7 +335,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                 h_out[:] = self.H_dict_[x]
         return H_out
 
-    def _init_w(self, V: np.array, X) -> Tuple[np.array, np.array, np.array]:
+    def _init_w(self) -> Tuple[np.array, np.array, np.array]:
         """
         Initialize the topics W.
         If self.init='random', topics are initialized with a Gamma
@@ -346,17 +382,66 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         # Copy parameter rho
         self.rho_ = self.rho
 
-        # Check if first item has str or np.str_ type
-
+        # Normalise the input to the engine's device once, up front: every
+        # downstream branch keys off `self.Xt_` / the type of X.
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
         self.Xt_= df_type(X)
+        # X = X[X.str.len() >3]
         # Make n-grams counts matrix unq_V
         # if deps.cudf and parse_version(cuml.__version__) > parse_version("23.04"):
         #     X = X.replace('nan',np.nan).fillna('0o0o0')
         #     X = X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
         unq_X, unq_V, lookup = self._init_vars(X)
-        n_batch = (len(X) - 1) // self.batch_size + 1
-        # Get activations unq_H
+        n_rows = len(X)
         del X
+        return self._fit_topics(unq_X, unq_V, lookup, n_rows, t)
+
+    # Ht @ W is dense (n_rows_in_step * vocab). The update keeps roughly this
+    # many copies of it alive at once: the product, its reciprocal, and the
+    # R/T intermediate.
+    _DENSE_COPIES = 3
+
+    def _dense_budget_mb(self) -> float:
+        """Memory available for the dense term, in MB.
+
+        gmem comes from nvidia-smi and is already MB; smem comes from psutil
+        and is bytes.
+        """
+        return self.gmem if self.engine == 'cuml' else self.smem / 1e6
+
+    def _plan_updates(self, sh: int, sw: int) -> Tuple[bool, int]:
+        """Decide whether the whole matrix fits, else how many rows per chunk.
+
+        Returns (fits_at_once, chunk_rows). Chunking by a memory-derived size
+        rather than the fixed batch_size keeps the dense term inside the
+        budget without falling back to tiny batches, which are dramatically
+        slower on GPU.
+        """
+        per_row_mb = (self.byte_lim * sw) / 1e6
+        budget = self._dense_budget_mb()
+        needed = per_row_mb * sh * self._DENSE_COPIES
+        if needed < budget:
+            return True, sh
+        # Spend half the budget on the dense term, leaving room for W/A/B,
+        # the sparse counts and allocator fragmentation.
+        chunk = int((budget * 0.5) / (per_row_mb * self._DENSE_COPIES)) if per_row_mb else sh
+        chunk = max(self.batch_size, min(chunk, sh))
+        logger.info(
+            f"dense term needs ~{needed:.0f} MB > budget {budget:.0f} MB; "
+            f"chunking {sh} rows at {chunk} per step"
+        )
+        return False, chunk
+
+    def _fit_topics(self, unq_X, unq_V, lookup, n_rows, t=None):
+        """Run the multiplicative updates for topics W given counts unq_V.
+
+        Shared by `fit` (fresh topics) and `partial_fit` (warm topics), so
+        the batching and device handling cannot drift between them.
+        """
+        if t is None:
+            t = time()
+        n_batch = (n_rows - 1) // self.batch_size + 1
+        # Get activations unq_H
         unq_H = self._get_H(unq_X)
         unq_V = csr(unq_V)
         sh = len(unq_H)
@@ -364,8 +449,16 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         if deps.cuml:
             self.gmem = get_gpu_memory()[0]
             logger.info(f"req gpu mem for fit=  `{(self.byte_lim*sh*sw)/1e6}`, free sys gmem= `{self.gmem}`")
+        # The smallfast path materialises Ht @ W, which is dense and costs
+        # n_unique * vocab * 8 bytes (several copies). Only take it when that
+        # fits; otherwise go straight to the batched loop, whose dense term is
+        # bounded by batch_size * vocab instead.
+        fits_at_once, chunk_rows = self._plan_updates(sh, sw)
+        if not fits_at_once:
+            n_batch = (n_rows - 1) // chunk_rows + 1
+        W_last = self.W_.copy()  # batched path only refreshes this on its last batch
         for n_iter_ in range(self.max_iter):
-            if self.engine =='cuml'  and ((self.byte_lim*sh*sw)/1e6)<self.gmem:  # small fast fit
+            if fits_at_once and self.engine == 'cuml':  # small fast fit
                 logger.debug(f"fitting smallfast-wise")
                 W_type = df_type(self.W_)
                 if 'cudf' in W_type:
@@ -374,33 +467,34 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                 elif 'cudf' not in W_type and 'cupy' not in W_type:
                     self.W_ = cp.array(self.W_); self.B_ = cp.array(self.B_); self.A_ = cp.array(self.A_);unq_H=cp.array(unq_H);unq_V=cp.array(unq_V);
                     logger.debug(f"moving to gpu for mat_mul fit")
-            elif self.engine !='cuml' and ((self.byte_lim*sh*sw)/1e6)<self.smem:  # small fast on cpu increases speed too
+            elif fits_at_once:  # small fast on cpu increases speed too
                 try:
                     self.W_ = self.W_.get(); self.B_ = self.B_.get(); self.A_ = self.A_.get(); unq_H=unq_H.get();unq_V=unq_V.get();
                     logger.debug(f"performing mat_mul speed trick on cpu")
                 except:
                     pass
-            W_last = self.W_.copy()
-            unq_H = _multiplicative_update_h_smallfast(
-                unq_V,
-                self.W_,
-                unq_H,
-                epsilon=1e-3,
-                max_iter=self.max_iter_e_step,
-                rescale_W=self.rescale_W,
-                gamma_shape_prior=self.gamma_shape_prior,
-                gamma_scale_prior=self.gamma_scale_prior,
-            )
-            _multiplicative_update_w_smallfast(
-                unq_V,
-                self.W_,
-                self.A_,
-                self.B_,
-                unq_H,
-                self.rescale_W,
-                self.rho_,
-            )
-            if (((self.byte_lim*sh*sw)/1e6)>self.gmem and self.engine =='cuml') or ( self.engine !='cuml' and ((self.byte_lim*sh*sw)/1e6)>self.smem):
+            if fits_at_once:
+                W_last = self.W_.copy()
+                unq_H = _multiplicative_update_h_smallfast(
+                    unq_V,
+                    self.W_,
+                    unq_H,
+                    epsilon=1e-3,
+                    max_iter=self.max_iter_e_step,
+                    rescale_W=self.rescale_W,
+                    gamma_shape_prior=self.gamma_shape_prior,
+                    gamma_scale_prior=self.gamma_scale_prior,
+                )
+                _multiplicative_update_w_smallfast(
+                    unq_V,
+                    self.W_,
+                    self.A_,
+                    self.B_,
+                    unq_H,
+                    self.rescale_W,
+                    self.rho_,
+                )
+            else:
                 W_type = df_type(self.W_)
                 if self.engine =='cuml' and ((self.byte_lim*sh)/1e6)<self.gmem and ((self.byte_lim*sw)/1e6)<self.gmem:  # standard loop but still gpu
                     if 'cudf' in W_type:
@@ -416,12 +510,14 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                         logger.debug(f"force numpy iterative fit")
                     except:
                         pass
-                for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=self.batch_size)):
+                # Same vectorised kernels as the whole-matrix path, applied one
+                # chunk at a time. The per-row variants below are ~1000x slower
+                # on GPU: they launch a handful of tiny kernels per row.
+                for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=chunk_rows)):
                     if i == n_batch - 1:
                         W_last = self.W_.copy()
                     # Update activations unq_H
-                    unq_H[unq_idx] = _multiplicative_update_h(
-                        self,
+                    unq_H[unq_idx] = _multiplicative_update_h_smallfast(
                         unq_V[unq_idx],
                         self.W_,
                         unq_H[unq_idx],
@@ -432,8 +528,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                         gamma_scale_prior=self.gamma_scale_prior,
                     )
                     # Update the topics self.W_
-                    _multiplicative_update_w(
-                        self,
+                    _multiplicative_update_w_smallfast(
                         unq_V[idx],
                         self.W_,
                         self.A_,
@@ -459,6 +554,36 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
             f"--GapEncoder Fitting took {(time() - t) / 60:.2f} minutes\n"
         )
         return self
+
+    def partial_fit(self, X, y=None) -> "GapEncoderColumn":
+        """
+        Fit the encoder on a chunk of X, keeping topics learnt so far.
+
+        The first call initialises the vocabulary and topics exactly like
+        `fit`; later calls reuse them, so memory is bounded by the chunk
+        rather than by the whole dataset.
+
+        Note: unless `hashing=True`, the n-gram vocabulary is frozen on the
+        first chunk and n-grams seen only in later chunks are ignored.
+        """
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
+        if not hasattr(self, "H_dict_") or not hasattr(self, "W_"):
+            return self.fit(X)
+
+        t = time()
+        self.Xt_ = df_type(X)
+        unq_X, lookup = _unique_strings(X, self.engine, return_lookup=True)
+        try:
+            unq_V = self.ngrams_count_.transform(unq_X)
+        except (IndexError, RuntimeError):
+            unq_X = unq_X.str.rjust(self.ngram_range[1], '0')
+            unq_V = self.ngrams_count_.transform(unq_X)
+        if self.add_words:
+            unq_V2 = self.word_count_.transform(unq_X)
+            unq_V = sparse.hstack((unq_V, unq_V2), format="csr")
+        # Give unseen strings an H row before the updates read H_dict_
+        self._add_unseen_keys_to_H_dict(unq_X)
+        return self._fit_topics(unq_X, unq_V, lookup, len(X), t)
 
     def get_feature_names(self, n_labels=3, prefix=""):
         """
@@ -540,6 +665,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
             unseen_X = cudf.Series(unseen_X)
         else:
             unseen_X = np.setdiff1d(X.astype(str), np.array([*self.H_dict_]))
+        
         if unseen_X.size > 0:
             unseen_V = self.ngrams_count_.transform(unseen_X)
             if self.add_words:
@@ -571,17 +697,21 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         """
         t = time()
         check_is_fitted(self, "H_dict_")
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
         # Check if first item has str or np.str_ type
         # if deps.cudf and parse_version(cuml.__version__) > parse_version("23.04"):
         #     X.replace('nan',np.nan).fillna('0o0o0')
         #     X = X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
-        if 'cudf' not in str(getmodule(X)) and 'cuml' not in self.engine:
-            unq_X = np.unique(X.astype(str))#
-        elif 'cudf' in str(getmodule(X)) and 'cuml' in self.engine:
-            unq_X = X.unique()
+        unq_X, _ = _unique_strings(X, self.engine)
+        if 'cudf' in str(getmodule(unq_X)):
             self.gmem = get_gpu_memory()[0]
         # Build the n-grams counts matrix V for the string data to encode
-        unq_V = self.ngrams_count_.transform(unq_X)#.astype(str))
+        try:
+            unq_V = self.ngrams_count_.transform(unq_X)
+        except (IndexError, RuntimeError):
+            unq_X = unq_X.str.rjust(self.ngram_range[1], '0')
+            unq_V = self.ngrams_count_.transform(unq_X)
+        # unq_V = self.ngrams_count_.transform(unq_X)#.astype(str))
         if self.add_words:  # Add words counts
             unq_V2 = self.word_count_.transform(unq_X.astype(str))
             unq_V = sparse.hstack((unq_V, unq_V2), format="csr")
@@ -592,8 +722,8 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         sw = max(self.W_.shape)
         
         # Loop over batches
-        logger.info(f"req gpu mem for transform =  `{(self.byte_lim*sh*sw)/1e6}`, free sys gmem = `{self.gmem}`")
-        if ((self.byte_lim*sh*sw)/1e6)<self.gmem:  # or ((self.byte_lim*sh*sw)/1e6)<self.smem:  # small fast transform gpu or cpu depending on input var types
+        fits_at_once, chunk_rows = self._plan_updates(sh, sw)
+        if fits_at_once:
             logger.debug(f"transforming smallfast-wise")
             W_type = df_type(self.W_)
             if 'cudf' in W_type and self.engine =='cuml':
@@ -602,7 +732,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
             elif 'cudf' not in W_type and 'cupy' not in W_type and self.engine =='cuml':
                 self.W_ = cp.array(self.W_); self.B_ = cp.array(self.B_); self.A_ = cp.array(self.A_)
                 logger.debug(f"moving to gpu for mat_mul transform")
-            elif self.engine !='cuml' and ((self.byte_lim*sh*sw)/1e6)<self.smem:  # small fast on cpu increases speed too
+            elif self.engine !='cuml':  # small fast on cpu increases speed too
                 try:
                     self.W_ = self.W_.get(); self.B_ = self.B_.get(); self.A_ = self.A_.get()
                     logger.debug(f"performing mat_mul speed trick on cpu for transform")
@@ -618,7 +748,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                     gamma_shape_prior=self.gamma_shape_prior,
                     gamma_scale_prior=self.gamma_scale_prior,
                 )
-        if ((self.byte_lim*sh*sw)/1e6)>self.gmem and ((self.byte_lim*sh*sw)/1e6)>self.smem:
+        else:
             W_type = df_type(self.W_)
             if self.engine =='cuml' and ((self.byte_lim*sh)/1e6)<self.gmem and ((self.byte_lim*sw)/1e6)<self.gmem:  # standard loop but still gpu
                 try:
@@ -654,10 +784,9 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
             #     except:
             #         pass
             #     logger.debug(f"force numpy transform")
-            for slc in gen_batches(n=unq_H.shape[0], batch_size=self.batch_size):
+            for slc in gen_batches(n=unq_H.shape[0], batch_size=chunk_rows):
                 # Given the learnt topics W, optimize H to fit V = HW
-                unq_H[slc] = _multiplicative_update_h(
-                    self,
+                unq_H[slc] = _multiplicative_update_h_smallfast(
                     unq_V[slc],
                     self.W_,
                     unq_H[slc],
@@ -679,7 +808,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         return self._get_H(X)
 
 
-class GapEncoder(BaseEstimator, TransformerMixin):
+class GapEncoder(TransformerMixin, BaseEstimator):
     """Constructs latent topics with continuous encoding.
 
     This encoder can be understood as a continuous encoding on a set of latent
@@ -916,23 +1045,18 @@ class GapEncoder(BaseEstimator, TransformerMixin):
                 f"'zero_impute', got {self.handle_missing!r}. "
             )
         self.Xt_ = df_type(X)
-        if 'cudf' not in self.Xt_:
-        # if not deps.cudf:
-            missing_mask = _object_dtype_isnan(X)
-
-            if missing_mask.any(axis=None):
-                if self.handle_missing == "error":
-                    raise ValueError("Input data contains missing values. ")
-                elif self.handle_missing == "zero_impute":
-                    X[missing_mask] = ""
-        else:
-            missing_mask = _object_dtype_isnan(X.to_pandas())
-            if missing_mask.any(axis=None): # != 0:
-                if self.handle_missing == "error":
-                    raise ValueError("Input data contains missing values. ")
-                elif self.handle_missing == "zero_impute":
-                    X[missing_mask] = ""
-        return X
+        on_gpu = 'cudf' in self.Xt_
+        host = X.to_pandas() if on_gpu else X
+        missing_mask = _object_dtype_isnan(host)
+        if not missing_mask.any(axis=None):
+            return X
+        if self.handle_missing == "error":
+            raise ValueError("Input data contains missing values. ")
+        # zero_impute: mask and frame must live on the same device, and a
+        # categorical column cannot take "" unless it is a plain object column
+        host = host.astype(object)
+        host[missing_mask] = ""
+        return cudf.from_pandas(host) if on_gpu else host
 
     def fit(self, X, y=None) -> "GapEncoder":
         """
@@ -950,7 +1074,6 @@ class GapEncoder(BaseEstimator, TransformerMixin):
         :class:`~cu_cat.GapEncoder`
             Fitted :class:`~cu_cat.GapEncoder` instance (self).
         """
-
         X, y = make_safe_gpu_dataframes(X, None, self.engine)
 
         # Check that n_samples >= n_components
@@ -990,6 +1113,59 @@ class GapEncoder(BaseEstimator, TransformerMixin):
                 self.fitted_models_.append(col_enc.fit(X.iloc[:,k]))#[k]))
         return self
 
+    def partial_fit(self, X, y=None) -> "GapEncoder":
+        """
+        Fit on a chunk of X, keeping the topics learnt from earlier chunks.
+
+        Lets a dataset larger than GPU memory be encoded chunk by chunk:
+        peak memory is set by the chunk, not by the full input. The first
+        call behaves exactly like `fit`.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            One chunk of the string data to fit on. Column count must match
+            across chunks.
+        y : None
+            Unused, only here for compatibility.
+
+        Returns
+        -------
+        :class:`~cu_cat.GapEncoder`
+            Fitted :class:`~cu_cat.GapEncoder` instance (self).
+
+        Notes
+        -----
+        Unless `hashing=True`, the n-gram vocabulary is frozen on the first
+        chunk, so n-grams that appear only in later chunks are ignored. Use
+        `hashing=True` when later chunks may introduce new vocabulary.
+        """
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
+        if not hasattr(self, "fitted_models_"):
+            if not self.hashing:
+                warnings.warn(
+                    "partial_fit freezes the n-gram vocabulary on the first "
+                    "chunk; pass hashing=True if later chunks introduce new "
+                    "vocabulary. ",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            return self.fit(X)
+
+        self.rho_ = self.rho
+        self.Xt_ = df_type(X)
+        if 'cudf' not in self.Xt_ or 'cuml' != self.engine or not deps.cudf:
+            X = check_input(X)
+        X = self._handle_missing(X)
+        if X.shape[1] != len(self.fitted_models_):
+            raise ValueError(
+                f"Number of columns changed between chunks: got {X.shape[1]}, "
+                f"expected {len(self.fitted_models_)}. "
+            )
+        for k in range(X.shape[1]):
+            self.fitted_models_[k].partial_fit(X.iloc[:, k])
+        return self
+
     def transform(self, X) -> np.array:
         """
         Return the encoded vectors (activations) H of input strings in X.
@@ -1013,6 +1189,7 @@ class GapEncoder(BaseEstimator, TransformerMixin):
         """
         check_is_fitted(self, "fitted_models_")
         # Check input data shape
+
         X = check_input(X)
         X = self._handle_missing(X)
         X_enc = []
@@ -1115,7 +1292,7 @@ def _multiplicative_update_w(
         W = cp.multiply(A, cp.reciprocal(B))
         if rescale_W:
             _rescale_W(W, A)
-        gc.collect()
+        # gc.collect()
 
     else:
         try:
@@ -1164,7 +1341,7 @@ def _multiplicative_update_w_smallfast(
         if rescale_W:
             _rescale_W(W, A)
         del C,R,T,Ht,Vt
-        gc.collect()
+        # gc.collect()
         cp._default_memory_pool.free_all_blocks()
 
     else:
@@ -1347,7 +1524,10 @@ def batch_lookup(
     Make batches of the lookup array.
     """
     len_iter = len(lookup)
+    # Keep the gather on-device: a host index array would force a copy per
+    # batch, which is what made the batched path host-bound.
+    xp = cp if (cp is not None and isinstance(lookup, cp.ndarray)) else np
     for idx in range(0, len_iter, n):
         indices = lookup[slice(idx, min(idx + n, len_iter))]
-        unq_indices = np.unique(indices)
+        unq_indices = xp.unique(indices)
         yield unq_indices, indices

@@ -5,7 +5,7 @@ from sklearn.model_selection import train_test_split
 
 from cu_cat import GapEncoder, TableVectorizer
 from cu_cat.datasets._fetching import fetch_midwest_survey
-from cu_cat.tests.utils import generate_data
+from cu_cat.tests.utils import generate_data, to_host
 
 MODULES = [pd]
 
@@ -61,7 +61,9 @@ def test_analyzer(
     # s2 = encoder.score(X)
 
     # Test inequality between the word and char analyzers output:
-    np.testing.assert_raises(AssertionError, np.testing.assert_array_equal, y1, y2)
+    np.testing.assert_raises(
+        AssertionError, np.testing.assert_array_equal, to_host(y1), to_host(y2)
+    )
     # np.testing.assert_raises(AssertionError, np.testing.assert_array_equal, s1, s2)
 
 
@@ -97,7 +99,7 @@ def test_gap_encoder(
 
     # Test L1-norm of topics W.
     for col_enc in encoder.fitted_models_:
-        l1_norm_W = np.abs(col_enc.W_).sum(axis=1)
+        l1_norm_W = np.abs(to_host(col_enc.W_)).sum(axis=1)
         np.testing.assert_array_almost_equal(l1_norm_W, np.ones(n_components))
 
     # Test same seed return the same output
@@ -111,7 +113,9 @@ def test_gap_encoder(
     )
     encoder.fit(X)
     y2 = encoder.transform(X)
-    np.testing.assert_array_equal(y, y2)
+    # GPU reductions are not bitwise reproducible across runs, so same-seed
+    # equality is checked to tight tolerance rather than exactly.
+    np.testing.assert_allclose(to_host(y), to_host(y2), rtol=1e-10, atol=1e-10)
 
 
 def test_get_feature_names_out(n_samples=70):
@@ -209,3 +213,96 @@ def test_transform_deterministic():
     topics2 = enc.get_feature_names_out()  # fit_tarnsform used by pyg so not worried about this
     # assert_array_equal(topics1, topics2)
     assert len(topics1) == len(topics2)
+
+
+def test_partial_fit_matches_fit_shape():
+    """Chunked fitting reaches the same encoding shape as a single fit."""
+    X = generate_data(60, random_state=0)
+
+    whole = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+    whole.fit(X)
+
+    chunked = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+    for start in range(0, len(X), 20):
+        chunked.partial_fit(X.iloc[start : start + 20])
+
+    assert len(chunked.fitted_models_) == len(whole.fitted_models_)
+    assert to_host(chunked.transform(X)).shape == to_host(whole.transform(X)).shape
+
+
+def test_partial_fit_learns_from_every_chunk():
+    """Topics keep moving as later chunks arrive, rather than freezing."""
+    X = generate_data(60, random_state=0)
+    enc = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+
+    enc.partial_fit(X.iloc[:20])
+    after_first = to_host(enc.fitted_models_[0].W_).copy()
+    enc.partial_fit(X.iloc[20:40])
+    after_second = to_host(enc.fitted_models_[0].W_)
+
+    assert after_first.shape == after_second.shape
+    assert not np.allclose(after_first, after_second)
+
+
+def test_partial_fit_rejects_column_count_change():
+    X = generate_data(40, random_state=0)
+    enc = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+    enc.partial_fit(X)
+    wider = pd.concat([X, X], axis=1)
+    wider.columns = ["a", "b"]  # cudf rejects duplicate names before our check
+    with pytest.raises(ValueError, match="columns changed"):
+        enc.partial_fit(wider)
+
+
+def test_plan_updates_chunks_when_over_budget():
+    """The planner falls back to a memory-derived chunk, not a fixed batch."""
+    from cu_cat._gap_encoder import GapEncoderColumn
+
+    enc = GapEncoderColumn(n_components=10, batch_size=128)
+    enc.engine = "cuml"
+    enc.gmem = 1000  # MB
+    enc.byte_lim = 8
+
+    # 1000 unique x 4096 vocab x 8B x 3 copies = ~98 MB -> fits
+    fits, chunk = enc._plan_updates(sh=1000, sw=4096)
+    assert fits and chunk == 1000
+
+    # 1e6 unique x 4096 vocab x 8B x 3 copies = ~98 GB -> must chunk
+    fits, chunk = enc._plan_updates(sh=1_000_000, sw=4096)
+    assert not fits
+    assert chunk >= enc.batch_size          # never worse than the old fixed size
+    assert chunk < 1_000_000
+    # the chunk's dense term must sit inside the budget
+    assert (enc.byte_lim * chunk * 4096 * enc._DENSE_COPIES) / 1e6 < enc.gmem
+
+
+def test_plan_updates_never_below_batch_size():
+    """A tiny budget still yields a usable chunk rather than zero rows."""
+    from cu_cat._gap_encoder import GapEncoderColumn
+
+    enc = GapEncoderColumn(n_components=10, batch_size=128)
+    enc.engine = "cuml"
+    enc.gmem = 1  # MB: absurdly small
+    fits, chunk = enc._plan_updates(sh=500_000, sw=4096)
+    assert not fits
+    assert chunk == enc.batch_size
+
+
+def test_unique_lookup_reconstructs_input():
+    """unq_X[lookup] must rebuild the input on every device.
+
+    Guards the ordering contract between the unique values and the inverse
+    index: they are consumed together by the batched update path, so a
+    mismatch there silently encodes rows against the wrong topics.
+    """
+    from cu_cat._dep_manager import deps
+    from cu_cat._gap_encoder import _unique_strings
+
+    # deliberately unsorted, with repeats
+    values = ["beta", "alpha", "gamma", "alpha", "beta", "beta", "delta"]
+    engine = "cuml" if deps.cudf else "sklearn"
+
+    unq_X, lookup = _unique_strings(pd.Series(values), engine, return_lookup=True)
+    rebuilt = np.asarray(to_host(unq_X))[np.asarray(to_host(lookup))]
+
+    assert list(rebuilt) == values

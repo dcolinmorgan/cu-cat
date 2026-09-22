@@ -16,6 +16,10 @@ dirty_cat = deps.dirty_cat
 
 MSG_PANDAS_DEPRECATED_WARNING = "Skip deprecation warning"
 
+requires_dirty_cat = pytest.mark.skipif(
+    dirty_cat is None, reason="dirty_cat not installed"
+)
+
 
 def check_same_transformers(
     expected_transformers: dict, actual_transformers: list
@@ -271,6 +275,7 @@ def test_check_fitted_table_vectorizer() -> None:
     tv.transform(X)
 
 
+@requires_dirty_cat
 def test_HN():
     # from cu_cat import TableVectorizer
     # import pandas as pd
@@ -289,6 +294,7 @@ def test_HN():
     #     assert aa.shape[0] == askHN.shape[0]
 
 
+@requires_dirty_cat
 def test_red_team():
     df = pd.read_csv('https://gist.githubusercontent.com/silkspace/c7b50d0c03dc59f63c48d68d696958ff/raw/31d918267f86f8252d42d2e9597ba6fc03fcdac2/redteam_50k.csv', index_col=0)
     red_team = pd.read_csv('https://gist.githubusercontent.com/silkspace/5cf5a94b9ac4b4ffe38904f20d93edb1/raw/888dabd86f88ea747cf9ff5f6c44725e21536465/redteam_labels.csv', index_col=0)
@@ -311,6 +317,7 @@ def test_red_team():
     #     assert aa.shape[0] == tdf.shape[0]
 
 
+@requires_dirty_cat
 def test_malware():
     edf = pd.read_csv('https://gist.githubusercontent.com/silkspace/33bde3e69ae24fee1298a66d1e00b467/raw/dc66bd6f1687270be7098f94b3929d6a055b4438/malware_bots.csv', index_col=0)
     T = edf.Label.apply(lambda x: True if 'Botnet' in x else False)
@@ -336,6 +343,7 @@ def test_malware():
         # assert aa.shape[0] == edf.shape[0]
 
 
+@requires_dirty_cat
 def test_small_news():
     from sklearn.datasets import fetch_20newsgroups
     n_samples = 1000

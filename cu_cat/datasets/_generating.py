@@ -61,6 +61,4 @@ def make_deduplication_data(
         # go back to 1d array of strings
         data.append(np.ascontiguousarray(str_as_list).view(f"U{len_ex}").ravel())
     data_out = np.concatenate(data).tolist()
-    if cudf:
-        data_out = cudf.DataFrame(data_out)
     return data_out
