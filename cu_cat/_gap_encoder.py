@@ -547,26 +547,40 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                     pass
             if fits_at_once:
                 W_last = self.W_.copy()
-                unq_H = _multiplicative_update_h_smallfast(
-                    unq_V,
-                    self.W_,
-                    unq_H,
-                    epsilon=1e-3,
-                    max_iter=self.max_iter_e_step,
-                    rescale_W=self.rescale_W,
-                    gamma_shape_prior=self.gamma_shape_prior,
-                    gamma_scale_prior=self.gamma_scale_prior,
-                )
-                _multiplicative_update_w_smallfast(
-                    unq_V,
-                    self.W_,
-                    self.A_,
-                    self.B_,
-                    unq_H,
-                    self.rescale_W,
-                    self.rho_,
-                )
-            else:
+                try:
+                    unq_H = _multiplicative_update_h_smallfast(
+                        unq_V,
+                        self.W_,
+                        unq_H,
+                        epsilon=1e-3,
+                        max_iter=self.max_iter_e_step,
+                        rescale_W=self.rescale_W,
+                        gamma_shape_prior=self.gamma_shape_prior,
+                        gamma_scale_prior=self.gamma_scale_prior,
+                    )
+                    _multiplicative_update_w_smallfast(
+                        unq_V,
+                        self.W_,
+                        self.A_,
+                        self.B_,
+                        unq_H,
+                        self.rescale_W,
+                        self.rho_,
+                    )
+                except MemoryError:
+                    # The budget said this fits, but free memory is only an
+                    # estimate: fragmentation or another process can break it.
+                    # Drop to blocks for this and every later iteration.
+                    if cp is not None:
+                        cp.get_default_memory_pool().free_all_blocks()
+                    fits_at_once = False
+                    chunk_rows = max(self.batch_size, sh // 2)
+                    n_batch = (sh - 1) // chunk_rows + 1
+                    logger.warning(
+                        f"whole-matrix update ran out of memory despite fitting "
+                        f"the estimate; falling back to {chunk_rows}-row blocks"
+                    )
+            if not fits_at_once:
                 W_type = df_type(self.W_)
                 if self.engine =='cuml' and ((self.byte_lim*sh)/1e6)<self.gmem and ((self.byte_lim*sw)/1e6)<self.gmem:  # standard loop but still gpu
                     if 'cudf' in W_type:
