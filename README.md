@@ -34,7 +34,25 @@ As we can see, with scale the divergence in speed is obvious.
 
 ![cu_cat scaling](https://github.com/graphistry/cu-cat/blob/e2bae616f84aab8e6d5e173fc5363370d7680dc6/examples/big_cucat_V_dirty.png?raw=true)
 
-However, this graph does not mean to imply the trend goes on forever, as currently **cu-cat** is single GPU and cannot batch (as the transfer cost is too much for our current needs), and thus each dataset, and indeed GPU + GPU memory, is unique, and thus these plots are meant merely for demonstrative purposes.
+However, this graph does not mean to imply the trend goes on forever: **cu-cat** is single GPU, and each dataset, GPU, and GPU memory budget is unique, so these plots are meant merely for demonstrative purposes.
+
+# Larger-than-memory datasets
+
+`GapEncoder` works on the *unique* strings in a column, so row count matters far less than cardinality. Two levers cover the cases where a dataset still does not fit:
+
+**Chunked fitting with `partial_fit`.** Peak memory is set by the chunk rather than by the whole input:
+
+```python
+from cu_cat import GapEncoder
+
+enc = GapEncoder(n_components=10, hashing=True)
+for chunk in pd.read_csv("huge.csv", chunksize=1_000_000):
+    enc.partial_fit(chunk[["dirty_column"]])
+encoded = enc.transform(df[["dirty_column"]])
+```
+
+**`hashing=True` for unbounded cardinality.** The default `CountVectorizer` learns a vocabulary, so it must see all unique strings at once and it freezes that vocabulary on the first `partial_fit` chunk. `HashingVectorizer` (`hashing=True`) is stateless with a fixed `hashing_n_features` width, so it needs no vocabulary pass and stays a constant size no matter how many distinct strings arrive. That makes it the right choice when the number of *distinct* values, not the number of rows, is what exceeds GPU memory.
+
 GPU = colab T4 + 15gb mem and colab CPU + 12gb memory
 
 

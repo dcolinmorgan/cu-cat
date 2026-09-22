@@ -386,9 +386,20 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         #     X = X.replace('nan',np.nan).fillna('0o0o0')
         #     X = X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
         unq_X, unq_V, lookup = self._init_vars(X)
-        n_batch = (len(X) - 1) // self.batch_size + 1
-        # Get activations unq_H
+        n_rows = len(X)
         del X
+        return self._fit_topics(unq_X, unq_V, lookup, n_rows, t)
+
+    def _fit_topics(self, unq_X, unq_V, lookup, n_rows, t=None):
+        """Run the multiplicative updates for topics W given counts unq_V.
+
+        Shared by `fit` (fresh topics) and `partial_fit` (warm topics), so
+        the batching and device handling cannot drift between them.
+        """
+        if t is None:
+            t = time()
+        n_batch = (n_rows - 1) // self.batch_size + 1
+        # Get activations unq_H
         unq_H = self._get_H(unq_X)
         unq_V = csr(unq_V)
         sh = len(unq_H)
@@ -396,8 +407,19 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         if deps.cuml:
             self.gmem = get_gpu_memory()[0]
             logger.info(f"req gpu mem for fit=  `{(self.byte_lim*sh*sw)/1e6}`, free sys gmem= `{self.gmem}`")
+        # The smallfast path materialises Ht @ W, which is dense and costs
+        # n_unique * vocab * 8 bytes (several copies). Only take it when that
+        # fits; otherwise go straight to the batched loop, whose dense term is
+        # bounded by batch_size * vocab instead.
+        budget = self.gmem if self.engine == 'cuml' else self.smem
+        fits_at_once = ((self.byte_lim * sh * sw) / 1e6) < budget
+        logger.info(
+            f"fit needs ~{(self.byte_lim*sh*sw)/1e6:.0f} MB dense, budget {budget} MB "
+            f"-> {'whole-matrix' if fits_at_once else 'batched'} updates"
+        )
+        W_last = self.W_.copy()  # batched path only refreshes this on its last batch
         for n_iter_ in range(self.max_iter):
-            if self.engine =='cuml'  and ((self.byte_lim*sh*sw)/1e6)<self.gmem:  # small fast fit
+            if fits_at_once and self.engine == 'cuml':  # small fast fit
                 logger.debug(f"fitting smallfast-wise")
                 W_type = df_type(self.W_)
                 if 'cudf' in W_type:
@@ -406,33 +428,34 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                 elif 'cudf' not in W_type and 'cupy' not in W_type:
                     self.W_ = cp.array(self.W_); self.B_ = cp.array(self.B_); self.A_ = cp.array(self.A_);unq_H=cp.array(unq_H);unq_V=cp.array(unq_V);
                     logger.debug(f"moving to gpu for mat_mul fit")
-            elif self.engine !='cuml' and ((self.byte_lim*sh*sw)/1e6)<self.smem:  # small fast on cpu increases speed too
+            elif fits_at_once:  # small fast on cpu increases speed too
                 try:
                     self.W_ = self.W_.get(); self.B_ = self.B_.get(); self.A_ = self.A_.get(); unq_H=unq_H.get();unq_V=unq_V.get();
                     logger.debug(f"performing mat_mul speed trick on cpu")
                 except:
                     pass
-            W_last = self.W_.copy()
-            unq_H = _multiplicative_update_h_smallfast(
-                unq_V,
-                self.W_,
-                unq_H,
-                epsilon=1e-3,
-                max_iter=self.max_iter_e_step,
-                rescale_W=self.rescale_W,
-                gamma_shape_prior=self.gamma_shape_prior,
-                gamma_scale_prior=self.gamma_scale_prior,
-            )
-            _multiplicative_update_w_smallfast(
-                unq_V,
-                self.W_,
-                self.A_,
-                self.B_,
-                unq_H,
-                self.rescale_W,
-                self.rho_,
-            )
-            if (((self.byte_lim*sh*sw)/1e6)>self.gmem and self.engine =='cuml') or ( self.engine !='cuml' and ((self.byte_lim*sh*sw)/1e6)>self.smem):
+            if fits_at_once:
+                W_last = self.W_.copy()
+                unq_H = _multiplicative_update_h_smallfast(
+                    unq_V,
+                    self.W_,
+                    unq_H,
+                    epsilon=1e-3,
+                    max_iter=self.max_iter_e_step,
+                    rescale_W=self.rescale_W,
+                    gamma_shape_prior=self.gamma_shape_prior,
+                    gamma_scale_prior=self.gamma_scale_prior,
+                )
+                _multiplicative_update_w_smallfast(
+                    unq_V,
+                    self.W_,
+                    self.A_,
+                    self.B_,
+                    unq_H,
+                    self.rescale_W,
+                    self.rho_,
+                )
+            else:
                 W_type = df_type(self.W_)
                 if self.engine =='cuml' and ((self.byte_lim*sh)/1e6)<self.gmem and ((self.byte_lim*sw)/1e6)<self.gmem:  # standard loop but still gpu
                     if 'cudf' in W_type:
@@ -491,6 +514,36 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
             f"--GapEncoder Fitting took {(time() - t) / 60:.2f} minutes\n"
         )
         return self
+
+    def partial_fit(self, X, y=None) -> "GapEncoderColumn":
+        """
+        Fit the encoder on a chunk of X, keeping topics learnt so far.
+
+        The first call initialises the vocabulary and topics exactly like
+        `fit`; later calls reuse them, so memory is bounded by the chunk
+        rather than by the whole dataset.
+
+        Note: unless `hashing=True`, the n-gram vocabulary is frozen on the
+        first chunk and n-grams seen only in later chunks are ignored.
+        """
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
+        if not hasattr(self, "H_dict_") or not hasattr(self, "W_"):
+            return self.fit(X)
+
+        t = time()
+        self.Xt_ = df_type(X)
+        unq_X, lookup = _unique_strings(X, self.engine, return_lookup=True)
+        try:
+            unq_V = self.ngrams_count_.transform(unq_X)
+        except (IndexError, RuntimeError):
+            unq_X = unq_X.str.rjust(self.ngram_range[1], '0')
+            unq_V = self.ngrams_count_.transform(unq_X)
+        if self.add_words:
+            unq_V2 = self.word_count_.transform(unq_X)
+            unq_V = sparse.hstack((unq_V, unq_V2), format="csr")
+        # Give unseen strings an H row before the updates read H_dict_
+        self._add_unseen_keys_to_H_dict(unq_X)
+        return self._fit_topics(unq_X, unq_V, lookup, len(X), t)
 
     def get_feature_names(self, n_labels=3, prefix=""):
         """
@@ -1019,6 +1072,59 @@ class GapEncoder(TransformerMixin, BaseEstimator):
             # for k in X.columns:
                 col_enc = self._create_column_gap_encoder()
                 self.fitted_models_.append(col_enc.fit(X.iloc[:,k]))#[k]))
+        return self
+
+    def partial_fit(self, X, y=None) -> "GapEncoder":
+        """
+        Fit on a chunk of X, keeping the topics learnt from earlier chunks.
+
+        Lets a dataset larger than GPU memory be encoded chunk by chunk:
+        peak memory is set by the chunk, not by the full input. The first
+        call behaves exactly like `fit`.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            One chunk of the string data to fit on. Column count must match
+            across chunks.
+        y : None
+            Unused, only here for compatibility.
+
+        Returns
+        -------
+        :class:`~cu_cat.GapEncoder`
+            Fitted :class:`~cu_cat.GapEncoder` instance (self).
+
+        Notes
+        -----
+        Unless `hashing=True`, the n-gram vocabulary is frozen on the first
+        chunk, so n-grams that appear only in later chunks are ignored. Use
+        `hashing=True` when later chunks may introduce new vocabulary.
+        """
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
+        if not hasattr(self, "fitted_models_"):
+            if not self.hashing:
+                warnings.warn(
+                    "partial_fit freezes the n-gram vocabulary on the first "
+                    "chunk; pass hashing=True if later chunks introduce new "
+                    "vocabulary. ",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            return self.fit(X)
+
+        self.rho_ = self.rho
+        self.Xt_ = df_type(X)
+        if 'cudf' not in self.Xt_ or 'cuml' != self.engine or not deps.cudf:
+            X = check_input(X)
+        X = self._handle_missing(X)
+        if X.shape[1] != len(self.fitted_models_):
+            raise ValueError(
+                f"Number of columns changed between chunks: got {X.shape[1]}, "
+                f"expected {len(self.fitted_models_)}. "
+            )
+        for k in range(X.shape[1]):
+            self.fitted_models_[k].partial_fit(X.iloc[:, k])
         return self
 
     def transform(self, X) -> np.array:

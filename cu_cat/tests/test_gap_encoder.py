@@ -213,3 +213,42 @@ def test_transform_deterministic():
     topics2 = enc.get_feature_names_out()  # fit_tarnsform used by pyg so not worried about this
     # assert_array_equal(topics1, topics2)
     assert len(topics1) == len(topics2)
+
+
+def test_partial_fit_matches_fit_shape():
+    """Chunked fitting reaches the same encoding shape as a single fit."""
+    X = generate_data(60, random_state=0)
+
+    whole = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+    whole.fit(X)
+
+    chunked = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+    for start in range(0, len(X), 20):
+        chunked.partial_fit(X.iloc[start : start + 20])
+
+    assert len(chunked.fitted_models_) == len(whole.fitted_models_)
+    assert to_host(chunked.transform(X)).shape == to_host(whole.transform(X)).shape
+
+
+def test_partial_fit_learns_from_every_chunk():
+    """Topics keep moving as later chunks arrive, rather than freezing."""
+    X = generate_data(60, random_state=0)
+    enc = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+
+    enc.partial_fit(X.iloc[:20])
+    after_first = to_host(enc.fitted_models_[0].W_).copy()
+    enc.partial_fit(X.iloc[20:40])
+    after_second = to_host(enc.fitted_models_[0].W_)
+
+    assert after_first.shape == after_second.shape
+    assert not np.allclose(after_first, after_second)
+
+
+def test_partial_fit_rejects_column_count_change():
+    X = generate_data(40, random_state=0)
+    enc = GapEncoder(n_components=3, max_iter=2, random_state=42, hashing=True)
+    enc.partial_fit(X)
+    wider = pd.concat([X, X], axis=1)
+    wider.columns = ["a", "b"]  # cudf rejects duplicate names before our check
+    with pytest.raises(ValueError, match="columns changed"):
+        enc.partial_fit(wider)
