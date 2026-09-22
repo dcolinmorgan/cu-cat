@@ -321,3 +321,54 @@ def test_transform_encodes_unseen_categories():
     assert np.isfinite(out).all()
     # the two unseen strings must not collapse onto the same encoding
     assert not np.allclose(out[0], out[2])
+
+
+def test_update_block_splits_on_out_of_memory(monkeypatch):
+    """A block that exhausts memory is halved rather than failing the fit."""
+    import cu_cat._gap_encoder as ge
+
+    enc = GapEncoder(n_components=3, max_iter=2, random_state=0, hashing=True)
+    enc.fit(generate_data(40, random_state=0))
+    col = enc.fitted_models_[0]
+
+    widths = []
+    real = ge._multiplicative_update_h_smallfast
+
+    def flaky(Vt, W, Ht, **kw):
+        widths.append(Vt.shape[0])
+        if Vt.shape[0] > 4:  # only the wide blocks "run out of memory"
+            raise MemoryError("simulated")
+        return real(Vt, W, Ht, **kw)
+
+    monkeypatch.setattr(ge, "_multiplicative_update_h_smallfast", flaky)
+    col.batch_size = 2
+
+    words = pd.Series(["aaaa bbbb", "cccc dddd", "eeee ffff", "gggg hhhh",
+                       "iiii jjjj", "kkkk llll", "mmmm nnnn", "oooo pppp"])
+    words, _ = ge.make_safe_gpu_dataframes(words, None, col.engine)
+    unq_V = col.ngrams_count_.transform(words)
+    xp = ge.cp if (ge.cp is not None and "cupy" in ge.df_type(col.W_)) else np
+    unq_H = xp.ones((8, col.n_components))
+    out = col._update_block(unq_V, unq_H, slice(0, 8), 8)
+
+    assert out.shape == (8, col.n_components)
+    assert max(widths) == 8 and min(widths) <= 4  # tried wide, fell back narrow
+
+
+def test_update_block_reports_levers_when_it_cannot_shrink():
+    """At the floor the error names what the user can actually change."""
+    import cu_cat._gap_encoder as ge
+
+    enc = GapEncoder(n_components=3, max_iter=2, random_state=0,
+                     hashing=True, hashing_n_features=256)
+    enc.fit(generate_data(40, random_state=0))
+    col = enc.fitted_models_[0]
+    col.batch_size = 64  # floor above the block we ask for
+
+    class Boom:
+        shape = (8, 4)
+        def __getitem__(self, _):
+            raise MemoryError("simulated")
+
+    with pytest.raises(MemoryError, match="hashing_n_features"):
+        col._update_block(Boom(), np.ones((8, 3)), slice(0, 8), 8)

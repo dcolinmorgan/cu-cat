@@ -449,6 +449,61 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         )
         return False, chunk
 
+    def _update_block(self, unq_V, unq_H, sl, chunk):
+        """Run the vectorised updates on one block, halving it if the GPU is full.
+
+        _plan_updates sizes blocks from *free* memory, but fragmentation, other
+        processes, or a bad byte_lim estimate can still exhaust the device. A
+        smaller block is always preferable to failing the fit, so split and
+        retry down to batch_size before giving up.
+        """
+        try:
+            H_new = _multiplicative_update_h_smallfast(
+                unq_V[sl],
+                self.W_,
+                unq_H[sl],
+                epsilon=1e-3,
+                max_iter=self.max_iter_e_step,
+                rescale_W=self.rescale_W,
+                gamma_shape_prior=self.gamma_shape_prior,
+                gamma_scale_prior=self.gamma_scale_prior,
+            )
+            _multiplicative_update_w_smallfast(
+                unq_V[sl],
+                self.W_,
+                self.A_,
+                self.B_,
+                H_new,
+                self.rescale_W,
+                self.rho_,
+            )
+            return H_new
+        except MemoryError:
+            width = sl.stop - sl.start
+            if cp is not None:
+                cp.get_default_memory_pool().free_all_blocks()
+            if width <= self.batch_size:
+                raise MemoryError(
+                    f"GPU ran out of memory on a {width}-row block, the smallest "
+                    f"this encoder will use. The dense term costs "
+                    f"n_unique * hashing_n_features * {self.byte_lim} bytes with "
+                    f"about {self._DENSE_COPIES} copies live: reduce "
+                    f"hashing_n_features (currently "
+                    f"{self.hashing_n_features if self.hashing else 'n/a, hashing=False'}), "
+                    f"fit on fewer distinct values per call via partial_fit, or "
+                    f"use a larger GPU. "
+                ) from None
+            half = width // 2
+            logger.warning(
+                f"out of memory on a {width}-row block; retrying at {half} rows"
+            )
+            mid = sl.start + half
+            self._update_block(unq_V, unq_H, slice(sl.start, mid), half)
+            first = unq_H[slice(sl.start, mid)]
+            second = self._update_block(unq_V, unq_H, slice(mid, sl.stop), half)
+            xp = cp if (cp is not None and 'cupy' in df_type(second)) else np
+            return xp.concatenate([first, second])
+
     def _fit_topics(self, unq_X, unq_V, lookup, n_rows, t=None):
         """Run the multiplicative updates for topics W given counts unq_V.
 
@@ -472,7 +527,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         # bounded by batch_size * vocab instead.
         fits_at_once, chunk_rows = self._plan_updates(sh, sw)
         if not fits_at_once:
-            n_batch = (n_rows - 1) // chunk_rows + 1
+            n_batch = (sh - 1) // chunk_rows + 1
         W_last = self.W_.copy()  # batched path only refreshes this on its last batch
         for n_iter_ in range(self.max_iter):
             if fits_at_once and self.engine == 'cuml':  # small fast fit
@@ -527,33 +582,16 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                         logger.debug(f"force numpy iterative fit")
                     except:
                         pass
-                # Same vectorised kernels as the whole-matrix path, applied one
-                # chunk at a time. The per-row variants below are ~1000x slower
-                # on GPU: they launch a handful of tiny kernels per row.
-                for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=chunk_rows)):
+                # Walk the *unique* axis, not the row axis. Slicing `lookup`
+                # would revisit each unique value once per row batch it appears
+                # in -- at 1M rows over 200k uniques that is ~4x the work, and
+                # every repeat re-runs the inner e-step. The whole-matrix path
+                # above also updates W from uniques, so this matches it exactly,
+                # just split into blocks.
+                for i, sl in enumerate(gen_batches(n=sh, batch_size=chunk_rows)):
                     if i == n_batch - 1:
                         W_last = self.W_.copy()
-                    # Update activations unq_H
-                    unq_H[unq_idx] = _multiplicative_update_h_smallfast(
-                        unq_V[unq_idx],
-                        self.W_,
-                        unq_H[unq_idx],
-                        epsilon=1e-3,
-                        max_iter=self.max_iter_e_step,
-                        rescale_W=self.rescale_W,
-                        gamma_shape_prior=self.gamma_shape_prior,
-                        gamma_scale_prior=self.gamma_scale_prior,
-                    )
-                    # Update the topics self.W_
-                    _multiplicative_update_w_smallfast(
-                        unq_V[idx],
-                        self.W_,
-                        self.A_,
-                        self.B_,
-                        unq_H[idx],
-                        self.rescale_W,
-                        self.rho_,
-                    )
+                    unq_H[sl] = self._update_block(unq_V, unq_H, sl, chunk_rows)
 
             # Compute the norm of the update of W in the last batch
             if deps.cp:
