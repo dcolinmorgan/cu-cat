@@ -1181,7 +1181,7 @@ class GapEncoder(TransformerMixin, BaseEstimator):
                 try:
                     self.fitted_models_.append(col_enc.fit(X[k]))
                 except KeyError:
-                    self.fitted_models_.append(col_enc.fit(X.iloc[k]))
+                    self.fitted_models_.append(col_enc.fit(X.iloc[:, k]))
         else :
             X = check_input(X)
             X = self._handle_missing(X)
