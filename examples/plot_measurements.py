@@ -28,14 +28,19 @@ ROWS_BEFORE = [0.3, 1.3, 6.0, OOM]
 ROWS_AFTER = [0.3, 1.2, 6.7, 16.8]
 
 # Distinct strings, at 1M rows. The dense Ht @ W term is n_unique x vocab.
-CARD = [1_000, 10_000, 50_000, 200_000]
-CARD_BEFORE = [2.1, 3.2, 9.5, OOM]          # whole-matrix updates only
-CARD_AFTER = [2.1, 3.2, 8.0, 100.2]         # chunked, vectorised kernels
+# After-fix measurements use the unique-axis chunking + OOM recovery.
+CARD = [1_000, 10_000, 50_000, 200_000, 400_000]
+CARD_BEFORE = [2.1, 3.2, 9.5, OOM, OOM]     # whole-matrix updates only
+CARD_AFTER = [2.1, 3.2, 8.1, 30.3, 56.0]    # chunked unique-axis, vectorised
 
-# Hash width at 200k distinct, 1M rows. 4096 does not fit and falls back to
-# chunking, which finished in 100.2s once the chunk loop was vectorised.
+# Transform times at 100k rows (after the transform speedup)
+TRANSFORM_100K = [None, None, 4.8, 7.7, 9.1]  # s, for 50k/200k/400k unique
+
+# Hash width at 200k distinct, 1M rows. At 4096 the dense term is ~19.5 GB,
+# beyond the T4's 15 GB, so chunking kicks in. With unique-axis chunking this
+# is now 30.3s instead of 100.2s with row-axis chunking.
 WIDTH = [512, 1024, 4096]
-WIDTH_FIT = [14.1, 17.2, 100.2]
+WIDTH_FIT = [14.1, 17.2, 30.3]
 
 
 def _plot_pair(ax, x, before, after, xlabel, title):
