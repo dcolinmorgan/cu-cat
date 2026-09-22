@@ -40,7 +40,7 @@ from sklearn.utils.fixes import _object_dtype_isnan
 from sklearn.utils.validation import check_is_fitted
 from sklearn.decomposition._nmf import _beta_divergence
 
-from ._utils import check_input, parse_version, get_gpu_memory, get_sys_memory, df_type#, make_math_df
+from ._utils import check_input, parse_version, get_gpu_memory, get_sys_memory, df_type
 
 
 from ._dep_manager import deps
