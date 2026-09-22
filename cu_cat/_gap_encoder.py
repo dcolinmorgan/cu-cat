@@ -287,7 +287,9 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         _, self.n_vocab = unq_V.shape
         # Init the topics W given the n-grams counts V
 
-        self.W_, self.A_, self.B_ = self._init_w(unq_V[lookup], X)
+        # NB: _init_w only needs self.n_vocab. Passing unq_V[lookup] used to
+        # expand the unique-row count matrix to full row count and throw it away.
+        self.W_, self.A_, self.B_ = self._init_w()
         # Init the activations unq_H of each unique input string
         unq_H = _rescale_h(self, unq_V, np.ones((len(unq_X), self.n_components)))
         # Update self.H_dict_ with unique input strings and their activations
@@ -327,7 +329,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                 h_out[:] = self.H_dict_[x]
         return H_out
 
-    def _init_w(self, V: np.array, X) -> Tuple[np.array, np.array, np.array]:
+    def _init_w(self) -> Tuple[np.array, np.array, np.array]:
         """
         Initialize the topics W.
         If self.init='random', topics are initialized with a Gamma
