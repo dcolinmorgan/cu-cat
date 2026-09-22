@@ -105,7 +105,7 @@ def _create_spelling_correction(
         Series with unique (original) words as indices and (estimated)
         corrected spelling of each word as values.
     """
-    count_series = pd.Series(counts, index=unique_words)
+    count_series = pd.Series(counts, index=unique_words)  # type: ignore[arg-type]
     original_spelling: List[str] = []
     corrected_spelling: List[str] = []
     for cluster in np.unique(clusters):
@@ -228,5 +228,5 @@ def deduplicate(
     clusters = fcluster(Z, n_clusters, criterion="maxclust")
 
     translation_table = _create_spelling_correction(unique_words, counts, clusters)
-    unrolled_corrections = translation_table[data]
+    unrolled_corrections = translation_table[data]  # type: ignore[call-overload]
     return unrolled_corrections

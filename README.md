@@ -61,6 +61,15 @@ encoded = enc.transform(df[["dirty_column"]])
 
 As a rule of thumb, keep `n_unique * hashing_n_features * 24` bytes under your free GPU memory. If you exceed it, cu-cat automatically chunks the updates to stay within budget rather than raising an out-of-memory error, but narrowing the width is far faster than relying on that fallback.
 
+**What happens when GPU memory runs out.** cu-cat degrades rather than failing:
+
+1. Block size is derived from free GPU memory before fitting starts, so the dense term is kept inside the budget.
+2. Free memory is only an estimate, so if a whole-matrix update still hits a CUDA out-of-memory error, the fit drops to blocks and continues.
+3. If an individual block cannot fit either, it is halved and retried.
+4. Only when a block at the minimum size still fails does it raise, and the error names the levers that help: lower `hashing_n_features`, fewer distinct values per call via `partial_fit`, or a larger GPU.
+
+Measured on a T4 with a deliberately optimistic budget (1M rows, 200k distinct strings, an estimate claiming 19.5 GB fits in 14 GB): the fit recovers and completes in 31.1s, against 30.3s when the budget is correct from the start.
+
 **`hashing=True` for unbounded cardinality.** The default `CountVectorizer` learns a vocabulary, so it must see all unique strings at once and it freezes that vocabulary on the first `partial_fit` chunk. `HashingVectorizer` (`hashing=True`) is stateless with a fixed `hashing_n_features` width, so it needs no vocabulary pass and stays a constant size no matter how many distinct strings arrive. That makes it the right choice when the number of *distinct* values, not the number of rows, is what exceeds GPU memory.
 
 GPU = colab T4 + 15gb mem and colab CPU + 12gb memory

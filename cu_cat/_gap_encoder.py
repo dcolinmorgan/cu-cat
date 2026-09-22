@@ -301,12 +301,29 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         # Update self.H_dict_ with unique input strings and their activations
         if 'cuml' in self.engine:
             self.H_dict_.update(zip(unq_X.to_arrow(), unq_H.values))
+            self._remember_keys(unq_X)
         else:
             self.H_dict_.update(zip(unq_X, unq_H))
+            self._remember_keys(unq_X)
         if self.rescale_rho:
             # Make update rate per iteration independent of the batch_size
             self.rho_ = self.rho ** (self.batch_size / len(X))
         return unq_X, unq_V, lookup
+
+    def _remember_keys(self, keys) -> None:
+        """Track the keys held in H_dict_ without leaving the device.
+
+        H_dict_ is keyed by pyarrow scalars, so asking it which strings it
+        knows costs one Python-level .as_py() per key. The callers already
+        hold the keys as a cudf.Series or numpy array, so keep a copy in that
+        form and let _add_unseen_keys_to_H_dict test membership in bulk.
+        """
+        prev = getattr(self, "_known_keys_", None)
+        if cudf is not None and isinstance(keys, cudf.Series):
+            self._known_keys_ = keys if prev is None else cudf.concat([prev, keys]).unique()
+        else:
+            arr = np.asarray(keys, dtype=object)
+            self._known_keys_ = arr if prev is None else np.union1d(prev, arr)
 
     def _get_H(self, X: np.array) -> np.array:
         """
@@ -432,6 +449,61 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         )
         return False, chunk
 
+    def _update_block(self, unq_V, unq_H, sl, chunk):
+        """Run the vectorised updates on one block, halving it if the GPU is full.
+
+        _plan_updates sizes blocks from *free* memory, but fragmentation, other
+        processes, or a bad byte_lim estimate can still exhaust the device. A
+        smaller block is always preferable to failing the fit, so split and
+        retry down to batch_size before giving up.
+        """
+        try:
+            H_new = _multiplicative_update_h_smallfast(
+                unq_V[sl],
+                self.W_,
+                unq_H[sl],
+                epsilon=1e-3,
+                max_iter=self.max_iter_e_step,
+                rescale_W=self.rescale_W,
+                gamma_shape_prior=self.gamma_shape_prior,
+                gamma_scale_prior=self.gamma_scale_prior,
+            )
+            _multiplicative_update_w_smallfast(
+                unq_V[sl],
+                self.W_,
+                self.A_,
+                self.B_,
+                H_new,
+                self.rescale_W,
+                self.rho_,
+            )
+            return H_new
+        except MemoryError:
+            width = sl.stop - sl.start
+            if cp is not None:
+                cp.get_default_memory_pool().free_all_blocks()
+            if width <= self.batch_size:
+                raise MemoryError(
+                    f"GPU ran out of memory on a {width}-row block, the smallest "
+                    f"this encoder will use. The dense term costs "
+                    f"n_unique * hashing_n_features * {self.byte_lim} bytes with "
+                    f"about {self._DENSE_COPIES} copies live: reduce "
+                    f"hashing_n_features (currently "
+                    f"{self.hashing_n_features if self.hashing else 'n/a, hashing=False'}), "
+                    f"fit on fewer distinct values per call via partial_fit, or "
+                    f"use a larger GPU. "
+                ) from None
+            half = width // 2
+            logger.warning(
+                f"out of memory on a {width}-row block; retrying at {half} rows"
+            )
+            mid = sl.start + half
+            self._update_block(unq_V, unq_H, slice(sl.start, mid), half)
+            first = unq_H[slice(sl.start, mid)]
+            second = self._update_block(unq_V, unq_H, slice(mid, sl.stop), half)
+            xp = cp if (cp is not None and 'cupy' in df_type(second)) else np
+            return xp.concatenate([first, second])
+
     def _fit_topics(self, unq_X, unq_V, lookup, n_rows, t=None):
         """Run the multiplicative updates for topics W given counts unq_V.
 
@@ -455,7 +527,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         # bounded by batch_size * vocab instead.
         fits_at_once, chunk_rows = self._plan_updates(sh, sw)
         if not fits_at_once:
-            n_batch = (n_rows - 1) // chunk_rows + 1
+            n_batch = (sh - 1) // chunk_rows + 1
         W_last = self.W_.copy()  # batched path only refreshes this on its last batch
         for n_iter_ in range(self.max_iter):
             if fits_at_once and self.engine == 'cuml':  # small fast fit
@@ -475,26 +547,40 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                     pass
             if fits_at_once:
                 W_last = self.W_.copy()
-                unq_H = _multiplicative_update_h_smallfast(
-                    unq_V,
-                    self.W_,
-                    unq_H,
-                    epsilon=1e-3,
-                    max_iter=self.max_iter_e_step,
-                    rescale_W=self.rescale_W,
-                    gamma_shape_prior=self.gamma_shape_prior,
-                    gamma_scale_prior=self.gamma_scale_prior,
-                )
-                _multiplicative_update_w_smallfast(
-                    unq_V,
-                    self.W_,
-                    self.A_,
-                    self.B_,
-                    unq_H,
-                    self.rescale_W,
-                    self.rho_,
-                )
-            else:
+                try:
+                    unq_H = _multiplicative_update_h_smallfast(
+                        unq_V,
+                        self.W_,
+                        unq_H,
+                        epsilon=1e-3,
+                        max_iter=self.max_iter_e_step,
+                        rescale_W=self.rescale_W,
+                        gamma_shape_prior=self.gamma_shape_prior,
+                        gamma_scale_prior=self.gamma_scale_prior,
+                    )
+                    _multiplicative_update_w_smallfast(
+                        unq_V,
+                        self.W_,
+                        self.A_,
+                        self.B_,
+                        unq_H,
+                        self.rescale_W,
+                        self.rho_,
+                    )
+                except MemoryError:
+                    # The budget said this fits, but free memory is only an
+                    # estimate: fragmentation or another process can break it.
+                    # Drop to blocks for this and every later iteration.
+                    if cp is not None:
+                        cp.get_default_memory_pool().free_all_blocks()
+                    fits_at_once = False
+                    chunk_rows = max(self.batch_size, sh // 2)
+                    n_batch = (sh - 1) // chunk_rows + 1
+                    logger.warning(
+                        f"whole-matrix update ran out of memory despite fitting "
+                        f"the estimate; falling back to {chunk_rows}-row blocks"
+                    )
+            if not fits_at_once:
                 W_type = df_type(self.W_)
                 if self.engine =='cuml' and ((self.byte_lim*sh)/1e6)<self.gmem and ((self.byte_lim*sw)/1e6)<self.gmem:  # standard loop but still gpu
                     if 'cudf' in W_type:
@@ -510,33 +596,16 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                         logger.debug(f"force numpy iterative fit")
                     except:
                         pass
-                # Same vectorised kernels as the whole-matrix path, applied one
-                # chunk at a time. The per-row variants below are ~1000x slower
-                # on GPU: they launch a handful of tiny kernels per row.
-                for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=chunk_rows)):
+                # Walk the *unique* axis, not the row axis. Slicing `lookup`
+                # would revisit each unique value once per row batch it appears
+                # in -- at 1M rows over 200k uniques that is ~4x the work, and
+                # every repeat re-runs the inner e-step. The whole-matrix path
+                # above also updates W from uniques, so this matches it exactly,
+                # just split into blocks.
+                for i, sl in enumerate(gen_batches(n=sh, batch_size=chunk_rows)):
                     if i == n_batch - 1:
                         W_last = self.W_.copy()
-                    # Update activations unq_H
-                    unq_H[unq_idx] = _multiplicative_update_h_smallfast(
-                        unq_V[unq_idx],
-                        self.W_,
-                        unq_H[unq_idx],
-                        epsilon=1e-3,
-                        max_iter=self.max_iter_e_step,
-                        rescale_W=self.rescale_W,
-                        gamma_shape_prior=self.gamma_shape_prior,
-                        gamma_scale_prior=self.gamma_scale_prior,
-                    )
-                    # Update the topics self.W_
-                    _multiplicative_update_w_smallfast(
-                        unq_V[idx],
-                        self.W_,
-                        self.A_,
-                        self.B_,
-                        unq_H[idx],
-                        self.rescale_W,
-                        self.rho_,
-                    )
+                    unq_H[sl] = self._update_block(unq_V, unq_H, sl, chunk_rows)
 
             # Compute the norm of the update of W in the last batch
             if deps.cp:
@@ -548,8 +617,10 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         if 'cudf' in df_type(unq_X) :
         # if deps.cudf:
             self.H_dict_.update(zip(unq_X.to_arrow(), unq_H))
+            self._remember_keys(unq_X)
         else:
             self.H_dict_.update(zip(unq_X, unq_H))
+            self._remember_keys(unq_X)
         logger.debug(
             f"--GapEncoder Fitting took {(time() - t) / 60:.2f} minutes\n"
         )
@@ -658,13 +729,17 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         Add activations of unseen string categories from X to H_dict.
         """
 
+        known = getattr(self, "_known_keys_", None)
         if 'cudf' in self.Xt_:
-        # if deps.cudf:
-            A = np.array([(item).as_py() for item in self.H_dict_])
-            unseen_X = np.setdiff1d(X.to_arrow(), A, assume_unique=True) 
-            unseen_X = cudf.Series(unseen_X)
+            if known is not None:
+                unseen_X = X[~X.isin(known)]
+            else:  # fitted before key tracking existed
+                A = np.array([(item).as_py() for item in self.H_dict_])
+                unseen_X = cudf.Series(np.setdiff1d(X.to_arrow(), A, assume_unique=True))
         else:
-            unseen_X = np.setdiff1d(X.astype(str), np.array([*self.H_dict_]))
+            if known is None:
+                known = np.array([*self.H_dict_], dtype=object)
+            unseen_X = np.setdiff1d(X.astype(str), known)
         
         if unseen_X.size > 0:
             unseen_V = self.ngrams_count_.transform(unseen_X)
@@ -677,8 +752,10 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
             if 'cudf' in df_type(unseen_X) :
             # if deps.cudf:
                 self.H_dict_.update(zip(unseen_X.to_arrow(), unseen_H.values))
+                self._remember_keys(unseen_X)
             else:
                 self.H_dict_.update(zip(unseen_X, unseen_H))
+                self._remember_keys(unseen_X)
 
     def transform(self, X) -> np.array:
         """
@@ -799,8 +876,10 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
         if 'cudf' in df_type(unq_X) :
         # if deps.cudf:
             self.H_dict_.update(zip(unq_X.to_arrow(), unq_H))
+            self._remember_keys(unq_X)
         else:
             self.H_dict_.update(zip(unq_X, unq_H))
+            self._remember_keys(unq_X)
         logger.debug(
             f"--GapEncoder Tranforming took {(time() - t) / 60:.2f} minutes\n"
         )

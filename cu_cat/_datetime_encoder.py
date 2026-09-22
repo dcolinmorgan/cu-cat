@@ -23,7 +23,7 @@ WORD_TO_ALIAS: Dict[str, str] = {
     "year": "Y",
     "month": "M",
     "day": "D",
-    "hour": "H",
+    "hour": "h",
     "minute": "min",
     "second": "S",
     "millisecond": "ms",

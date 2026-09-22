@@ -16,12 +16,12 @@ core_requires = [
 ]
 
 stubs = [
-  'pandas-stubs', 'types-requests', 'ipython', 'tqdm-stubs'
+  'pandas-stubs<2.2', 'types-requests', 'ipython', 'tqdm-stubs'
 ]
 
 dev_extras = {
     'docs': ['sphinx==3.4.3', 'docutils==0.16', 'sphinx_autodoc_typehints==1.11.1', 'sphinx-rtd-theme==0.5.1', 'Jinja2<3.1'],
-    'test': ['flake8>=5.0', 'mock', 'mypy', 'pytest'] + stubs,
+    'test': ['flake8>=5.0', 'mock', 'mypy>=1.19,<1.20', 'pytest'] + stubs,
     'testai': [
       'numba>=0.57.1'  # https://github.com/numba/numba/issues/8615
     ],
@@ -66,7 +66,7 @@ setup(
     long_description_content_type='text/markdown',
     url='https://github.com/graphistry/cu-cat',
     download_url= 'https://github.com/graphistry/cu-cat',
-    python_requires='>=3.8',
+    python_requires='>=3.10',
 
     author='The Graphistry Team',
     author_email='pygraphistry@graphistry.com',
