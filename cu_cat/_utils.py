@@ -15,11 +15,11 @@ psutil = deps.psutil
 # import cupy as cp
 
 try:
-    # Works for sklearn >= 1.0
+    # Works for sklearn >= 1.0, < 1.7
     from sklearn.utils import parse_version  # noqa
 except ImportError:
-    # Works for sklearn < 1.0
-    from sklearn.utils.fixes import _parse_version as parse_version  # noqa
+    # sklearn >= 1.7 keeps it private
+    from sklearn.utils.fixes import parse_version  # noqa
 
 
 class LRUDict:

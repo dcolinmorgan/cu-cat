@@ -15,7 +15,7 @@ import pandas as pd
 import sklearn
 from pandas.core.dtypes.base import ExtensionDtype
 from sklearn import __version__ as sklearn_version
-from sklearn.base import TransformerMixin, clone
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.utils.deprecation import deprecated
 from sklearn.utils.validation import check_is_fitted
 
@@ -188,7 +188,7 @@ def _replace_missing_in_cat_col(ser: pd.Series, value: str = "missing") -> pd.Se
     replaces the missing values, and returns it.
     """
     ser = _replace_false_missing(ser)  # type: ignore
-    if pd.api.types.is_categorical_dtype(ser) and (value not in ser.cat.categories):  # type: ignore
+    if isinstance(ser.dtype, pd.CategoricalDtype) and (value not in ser.cat.categories):
         ser = ser.cat.add_categories([value])
     ser = ser.fillna(value=value)
     return ser
@@ -197,6 +197,45 @@ def _replace_missing_in_cat_col(ser: pd.Series, value: str = "missing") -> pd.Se
 OptionalTransformer = Optional[
     Union[TransformerMixin, Literal["drop", "remainder", "passthrough"]]
 ]
+
+
+class _OnHost(TransformerMixin, BaseEstimator):
+    """Run a CPU-only transformer on host data inside a GPU pipeline.
+
+    cuml's ColumnTransformer hands each transformer a cudf frame, and cudf
+    refuses implicit conversion to numpy. Any user-supplied scikit-learn
+    transformer (e.g. StandardScaler) would therefore raise; wrapping it keeps
+    such transformers usable without forcing the whole pipeline back to CPU.
+    """
+
+    def __init__(self, transformer):
+        self.transformer = transformer
+
+    @staticmethod
+    def _to_host(X):
+        return X.to_pandas() if hasattr(X, "to_pandas") else X
+
+    def fit(self, X, y=None):
+        self.transformer.fit(self._to_host(X), y)
+        return self
+
+    def transform(self, X):
+        return self.transformer.transform(self._to_host(X))
+
+    def fit_transform(self, X, y=None, **fit_params):
+        return self.transformer.fit_transform(self._to_host(X), y, **fit_params)
+
+    def get_feature_names_out(self, input_features=None):
+        return self.transformer.get_feature_names_out(input_features)
+
+
+def _wrap_if_cpu_only(transformer, engine):
+    """Wrap `transformer` when it cannot consume the GPU dataframes we produce."""
+    if engine != "cuml" or not isinstance(transformer, sklearn.base.TransformerMixin):
+        return transformer
+    if "cuml" in str(type(transformer).__module__) or isinstance(transformer, _OnHost):
+        return transformer
+    return _OnHost(transformer)
 
 
 class TableVectorizer(ColumnTransformer):
@@ -503,6 +542,15 @@ class TableVectorizer(ColumnTransformer):
 
         self.datetime_transformer_ = "passthrough" # self.datetime_transformer
 
+        # Anything scikit-learn-only needs host data when we run on GPU.
+        engine = "cuml" if deps.cudf else "pandas"
+        self.low_cardinality_transformer_ = _wrap_if_cpu_only(
+            self.low_cardinality_transformer_, engine
+        )
+        self.numerical_transformer_ = _wrap_if_cpu_only(
+            self.numerical_transformer_, engine
+        )
+
         # TODO: check that the provided transformers are valid
 
     def _auto_cast(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -532,16 +580,24 @@ class TableVectorizer(ColumnTransformer):
         X = _replace_false_missing(X)  # type: ignore
 
         # Handle missing values
-        obj_col = X.select_dtypes(include=['object']).columns
+        obj_col = X.select_dtypes(include=['object', 'string']).columns
         for i in obj_col:
+            try:
+                # numbers hiding in an object column: keep them numeric
+                X[i] = pd.to_numeric(X[i])
+                continue
+            except (ValueError, TypeError):
+                pass
             X[i] = X[i].replace('nan',np.nan).fillna('0o0o0')
-            X[i] = X[i].str.rjust(4,'0')
+            # object cols may hold non-strings (e.g. after .astype(object)),
+            # so cast before using the .str accessor
+            X[i] = X[i].astype(str).str.rjust(4,'0')
             # X[i] = X[i].str.replace('.', 'dot', regex=False) #for IP addresses
 
         num_col = X.select_dtypes(include=['int64','float64']).columns
         for i in num_col:
             X[i] = X[i].fillna(0)
-            X[i] = pd.to_numeric(X[i],downcast='float',errors='ignore')  # type: ignore
+            X[i] = pd.to_numeric(X[i], downcast='float')  # type: ignore
 
         for col in X.columns:            
             # Convert pandas' NaN value (pd.NA) to numpy NaN value (np.nan)
@@ -552,7 +608,7 @@ class TableVectorizer(ColumnTransformer):
                 # pd.NA, so they must be converted to np.float64 before.
                 if pd.api.types.is_numeric_dtype(X[col]):
                     X[col] = X[col].astype(np.float64)
-                X[col].fillna(value=np.nan, inplace=True)
+                X[col] = X[col].fillna(value=np.nan)
 
         # Convert to the best possible data type
         self.types_ = {}
@@ -567,7 +623,7 @@ class TableVectorizer(ColumnTransformer):
             # for earlier versions of sklearn. FIXME: which ?
             if issubclass(X[col].dtype.__class__, ExtensionDtype):
                 try:
-                    X[col] = X[col].astype(X[col].dtype.type, errors="ignore")
+                    X[col] = X[col].astype(X[col].dtype.type)
                 except (TypeError, ValueError):
                     pass
             self.types_.update({col: X[col].dtype})  # type: ignore
@@ -586,13 +642,13 @@ class TableVectorizer(ColumnTransformer):
             if _has_missing_values(self,X[col]):
                 if pd.api.types.is_numeric_dtype(X[col]):
                     X[col] = X[col].astype(np.float64)
-                X[col].fillna(value=np.nan, inplace=True)
+                X[col] = X[col].fillna(value=np.nan)
         for col in self.imputed_columns_:
             X[col] = _replace_missing_in_cat_col(X[col])
         for col, dtype in self.types_.items():
             # if categorical, add the new categories to prevent	
             # them to be encoded as nan	
-            if pd.api.types.is_categorical_dtype(dtype):  # type: ignore
+            if isinstance(dtype, pd.CategoricalDtype):
                 known_categories = dtype.categories # type: ignore
                 new_categories = pd.unique(X[col])	
                 dtype = pd.CategoricalDtype(  # type: ignore
@@ -695,14 +751,14 @@ class TableVectorizer(ColumnTransformer):
         # Create the list of all the transformers.
         if self.datetime_transformer_ != "passthrough":
             all_transformers: List[Tuple[str, OptionalTransformer, List[str]]] = [  # type: ignore
-                ("numeric", self.numerical_transformer, numeric_columns),
+                ("numeric", self.numerical_transformer_, numeric_columns),
                 ("datetime", self.datetime_transformer_, datetime_columns),
                 ("low_cardinality", self.low_cardinality_transformer_, low_cardinality_columns),
                 ("high_cardinality", self.high_cardinality_transformer_, high_cardinality_columns),
             ]
         else:
             all_transformers: List[Tuple[str, OptionalTransformer, List[str]]] = [  # type: ignore
-            ("numeric", self.numerical_transformer, numeric_columns),
+            ("numeric", self.numerical_transformer_, numeric_columns),
             # ("datetime", self.datetime_transformer_, datetime_columns), ## commented out if in dt format so pyg can handle
             ("low_cardinality", self.low_cardinality_transformer_, low_cardinality_columns),
             ("high_cardinality", self.high_cardinality_transformer_, high_cardinality_columns),
@@ -856,7 +912,7 @@ class TableVectorizer(ColumnTransformer):
 
         all_trans_feature_names = []
 
-        for name, trans, cols, _ in self._iter(fitted=True):
+        for name, trans, cols in self.transformers_:
             if isinstance(trans, str):
                 if trans == "drop":
                     continue

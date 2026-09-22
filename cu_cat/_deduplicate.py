@@ -7,16 +7,12 @@ from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import pdist, squareform
-from ._dep_manager import deps
-cuml = deps.cuml
-if cuml:
-    import cudf as pd, cupy as np
-    from cuml.feature_extraction.text import TfidfVectorizer
-    from cuml.metrics.cluster import silhouette_score
-else:
-    import numpy as np, pandas as pd
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics import silhouette_score
+
+# Deduplication is scipy-bound (pdist/linkage/fcluster), so it stays on the host:
+# cupy arrays cannot feed scipy and the GPU vectorizer buys nothing here.
+import numpy as np, pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import silhouette_score
 
 
 def compute_ngram_distance(
@@ -71,10 +67,10 @@ def _guess_clusters(Z: np.ndarray, distance_mat: np.ndarray) -> int:
     int
         number of clusters that maximize the silhouette score.
     """
-    max_clusters = distance_mat.shape[0]
-    n_clusters = np.arange(2, max_clusters)
     # silhouette score needs a redundant distance matrix
     redundant_dist = squareform(distance_mat)
+    # at most n_samples - 1 labels are valid for the silhouette score
+    n_clusters = np.arange(2, redundant_dist.shape[0])
     silhouette_scores = []
     for n_clust in n_clusters:
         labels = fcluster(Z, n_clust, criterion="maxclust")

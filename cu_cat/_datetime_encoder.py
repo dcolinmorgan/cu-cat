@@ -44,7 +44,7 @@ AcceptedTimeValues = Literal[
 ]
 
 
-class DatetimeEncoder(BaseEstimator, TransformerMixin):
+class DatetimeEncoder(TransformerMixin, BaseEstimator):
     """
     Transforms each datetime column into several numeric columns for temporal features (e.g year, month, day...).
 

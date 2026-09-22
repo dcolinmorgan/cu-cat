@@ -76,11 +76,17 @@ def make_safe_gpu_dataframes(X, y, engine):
         assert cudf is not None
         new_kwargs = {}
         kwargs = {'X': X, 'y': y}
+        want_cpu = engine in ["pandas", "sklearn", "cpu"]
         for key, value in kwargs.items():
-            if isinstance(value, cudf.DataFrame) and engine in ["pandas", "sklearn", "cpu"]:
+            if value is None:
+                new_kwargs[key] = value
+            elif want_cpu and isinstance(value, (cudf.DataFrame, cudf.Series)):
                 new_kwargs[key] = value.to_pandas()
-            elif isinstance(value, pd.DataFrame) and engine in ["cuml", "cuda", "gpu"]:
+            elif not want_cpu and isinstance(value, (pd.DataFrame, pd.Series)):
                 new_kwargs[key] = cudf.from_pandas(value)
+            elif not want_cpu and isinstance(value, np.ndarray) and value.ndim == 1:
+                # GapEncoderColumn is handed raw 1-d arrays; cuml needs a cudf.Series
+                new_kwargs[key] = cudf.Series(value)
             else:
                 new_kwargs[key] = value
         return new_kwargs['X'], new_kwargs['y']
@@ -89,6 +95,25 @@ def make_safe_gpu_dataframes(X, y, engine):
 
 EngineConcrete = Literal['cuml', 'sklearn']
 Engine = Literal[EngineConcrete, "auto"]
+
+
+def _unique_strings(X, engine, return_lookup=False):
+    """Unique values of X, on whichever device `engine` wants them.
+
+    Returns (unique_values, lookup) where lookup is the inverse index into the
+    unique values (None unless requested). Keeping this in one place means the
+    cudf and numpy paths cannot drift apart.
+    """
+    X, _ = make_safe_gpu_dataframes(X, None, engine)
+    if 'cudf' in str(getmodule(X)):
+        unq_X = X.unique()
+        if not return_lookup:
+            return unq_X, None
+        _, lookup = np.unique(X.to_pandas(), return_inverse=True)
+        return unq_X, lookup
+    if return_lookup:
+        return np.unique(X.astype(str), return_inverse=True)
+    return np.unique(X.astype(str)), None
 
 
 def resolve_engine(
@@ -120,7 +145,7 @@ def resolve_engine(
         f"but received: {engine} :: {type(engine)}"
     )
 
-class GapEncoderColumn(BaseEstimator, TransformerMixin):
+class GapEncoderColumn(TransformerMixin, BaseEstimator):
 
     """See GapEncoder's docstring."""
 
@@ -200,7 +225,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         the topics W.
         """
         self.Xt_ = df_type(X)
-        X = X[X.str.len() >3]  # cudf CV has trouble with shorter strings
+        # X = X[X.str.len() >3]  # cudf CV has trouble with shorter strings
         # if deps.cudf and parse_version(cuml.__version__) > parse_version("23.04"):
             # X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
         # cuml.set_global_output_type('cupy')
@@ -234,16 +259,14 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         #     X = X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
         # X.convert_dtypes()
         # Build the n-grams counts matrix unq_V on unique elements of X
-        X, y = make_safe_gpu_dataframes(X, None, self.engine)
-        if 'cudf' not in str(getmodule(X)) and 'cuml' not in self.engine:
-            unq_X, lookup = np.unique(X.astype(str), return_inverse=True)
-        elif 'cudf' in str(getmodule(X)) and 'cuml' in self.engine:
-            unq_X = X.unique()
-            tmp, lookup = np.unique(X.to_pandas(), return_inverse=True)
+        unq_X, lookup = _unique_strings(X, self.engine, return_lookup=True)
         try:
             unq_V = self.ngrams_count_.fit_transform(unq_X)
-        except IndexError:
-            unq_X = unq_X[unq_X.str.len() > 3]  # cuml CV has trouble with shorter strings
+        except (IndexError, RuntimeError):
+            # libcudf's generate_ngrams needs every string to have at least
+            # ngram_range[1] characters. Pad rather than filter: dropping rows
+            # here desynchronises `lookup`, which indexes the full input.
+            unq_X = unq_X.str.rjust(self.ngram_range[1], '0')
             unq_V = self.ngrams_count_.fit_transform(unq_X)
         if self.add_words:  # Add word counts to unq_V
             unq_V2 = self.word_count_.fit_transform(unq_X)
@@ -351,10 +374,11 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         # Copy parameter rho
         self.rho_ = self.rho
 
-        # Check if first item has str or np.str_ type
-
+        # Normalise the input to the engine's device once, up front: every
+        # downstream branch keys off `self.Xt_` / the type of X.
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
         self.Xt_= df_type(X)
-        X = X[X.str.len() >3]
+        # X = X[X.str.len() >3]
         # Make n-grams counts matrix unq_V
         # if deps.cudf and parse_version(cuml.__version__) > parse_version("23.04"):
         #     X = X.replace('nan',np.nan).fillna('0o0o0')
@@ -577,22 +601,20 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
             Transformed input.
         """
         t = time()
-        X = X[X.str.len() >3]
         check_is_fitted(self, "H_dict_")
+        X, _ = make_safe_gpu_dataframes(X, None, self.engine)
         # Check if first item has str or np.str_ type
         # if deps.cudf and parse_version(cuml.__version__) > parse_version("23.04"):
         #     X.replace('nan',np.nan).fillna('0o0o0')
         #     X = X.apply(lambda x: str((x)).zfill(4)) ## need at least >3 chars for gap encoder
-        if 'cudf' not in str(getmodule(X)) and 'cuml' not in self.engine:
-            unq_X = np.unique(X.astype(str))#
-        elif 'cudf' in str(getmodule(X)) and 'cuml' in self.engine:
-            unq_X = X.unique()
+        unq_X, _ = _unique_strings(X, self.engine)
+        if 'cudf' in str(getmodule(unq_X)):
             self.gmem = get_gpu_memory()[0]
         # Build the n-grams counts matrix V for the string data to encode
         try:
             unq_V = self.ngrams_count_.transform(unq_X)
-        except IndexError:
-            unq_X = unq_X[unq_X.str.len() > 3]  # cuml CV has trouble with shorter strings
+        except (IndexError, RuntimeError):
+            unq_X = unq_X.str.rjust(self.ngram_range[1], '0')
             unq_V = self.ngrams_count_.transform(unq_X)
         # unq_V = self.ngrams_count_.transform(unq_X)#.astype(str))
         if self.add_words:  # Add words counts
@@ -692,7 +714,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         return self._get_H(X)
 
 
-class GapEncoder(BaseEstimator, TransformerMixin):
+class GapEncoder(TransformerMixin, BaseEstimator):
     """Constructs latent topics with continuous encoding.
 
     This encoder can be understood as a continuous encoding on a set of latent
@@ -929,23 +951,18 @@ class GapEncoder(BaseEstimator, TransformerMixin):
                 f"'zero_impute', got {self.handle_missing!r}. "
             )
         self.Xt_ = df_type(X)
-        if 'cudf' not in self.Xt_:
-        # if not deps.cudf:
-            missing_mask = _object_dtype_isnan(X)
-
-            if missing_mask.any(axis=None):
-                if self.handle_missing == "error":
-                    raise ValueError("Input data contains missing values. ")
-                elif self.handle_missing == "zero_impute":
-                    X[missing_mask] = ""
-        else:
-            missing_mask = _object_dtype_isnan(X.to_pandas())
-            if missing_mask.any(axis=None): # != 0:
-                if self.handle_missing == "error":
-                    raise ValueError("Input data contains missing values. ")
-                elif self.handle_missing == "zero_impute":
-                    X[missing_mask] = ""
-        return X
+        on_gpu = 'cudf' in self.Xt_
+        host = X.to_pandas() if on_gpu else X
+        missing_mask = _object_dtype_isnan(host)
+        if not missing_mask.any(axis=None):
+            return X
+        if self.handle_missing == "error":
+            raise ValueError("Input data contains missing values. ")
+        # zero_impute: mask and frame must live on the same device, and a
+        # categorical column cannot take "" unless it is a plain object column
+        host = host.astype(object)
+        host[missing_mask] = ""
+        return cudf.from_pandas(host) if on_gpu else host
 
     def fit(self, X, y=None) -> "GapEncoder":
         """
