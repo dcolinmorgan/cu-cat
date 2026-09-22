@@ -70,7 +70,16 @@ As a rule of thumb, keep `n_unique * hashing_n_features * 24` bytes under your f
 
 Measured on a T4 with a deliberately optimistic budget (1M rows, 200k distinct strings, an estimate claiming 19.5 GB fits in 14 GB): the fit recovers and completes in 31.1s, against 30.3s when the budget is correct from the start.
 
-**Status vs dirty_cat.** dirty_cat (the original CPU implementation this library extends) has not been updated for pandas ≥2.2 and fails on the deprecated `'H'` datetime frequency alias. cu-cat works on pandas 3, numpy 2, and sklearn 1.6+, so it is currently the only option for modern stacks. GPU acceleration is a bonus on top of that.
+**Comparison with skrub.** skrub is the maintained successor to dirty_cat. On CPU with matched parameters (50k rows, 5k unique strings, hashing=True):
+
+| | skrub | cu-cat CPU | cu-cat GPU (T4) |
+|---|---|---|---|
+| fit | 7.1s | 3.6s (2.0x) | 8.1s* |
+| transform | 2.5s | 3.3s (0.8x) | 4.8s* |
+
+\* GPU measurements at 1M rows / 50k unique — different scale, not directly comparable. The GPU advantage appears at higher cardinality where CPU becomes memory-bound.
+
+dirty_cat (the predecessor) has not been updated for pandas ≥2.2 and fails on the deprecated `'H'` datetime frequency alias.
 
 **`hashing=True` for unbounded cardinality.** The default `CountVectorizer` learns a vocabulary, so it must see all unique strings at once and it freezes that vocabulary on the first `partial_fit` chunk. `HashingVectorizer` (`hashing=True`) is stateless with a fixed `hashing_n_features` width, so it needs no vocabulary pass and stays a constant size no matter how many distinct strings arrive. That makes it the right choice when the number of *distinct* values, not the number of rows, is what exceeds GPU memory.
 
