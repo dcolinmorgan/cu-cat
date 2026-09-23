@@ -72,15 +72,22 @@ Measured on a T4 with a deliberately optimistic budget (1M rows, 200k distinct s
 
 **Comparison with skrub.** skrub is the maintained successor to dirty_cat. With matched parameters (hashing=True, n_components=10, max_iter=5):
 
-![Scaling comparison](examples/scaling_comparison.png)
+![Scaling comparison](examples/skrub_comparison.png)
 
-Key findings:
-- **At low cardinality (<10k unique):** skrub and cu-cat GPU are comparable
-- **At medium cardinality (10-20k unique):** cu-cat GPU is 2-2.5x faster  
-- **At high cardinality (>20k unique):** skrub crashes; cu-cat GPU scales to 400k+ unique strings
-- **cu-cat GPU at 1M rows / 200k unique:** 38s total (where skrub cannot run at all)
+| Unique strings | skrub (CPU) | cu-cat (GPU T4) | Winner |
+|----------------|-------------|-----------------|--------|
+| 100 | 0.06s | 6.2s | skrub (GPU has CUDA warmup) |
+| 1,000 | 0.7s | 0.9s | ~equal |
+| 5,000 | 5.4s | 3.1s | **GPU 1.7x** |
+| 10,000 | 11.9s | 4.8s | **GPU 2.5x** |
+| 50,000 | CRASH | 26s | GPU only |
+| 100,000 | CRASH | 54s | GPU only |
+| 500,000 | CRASH | 5.1 min | GPU only |
+| 1,000,000 | CRASH | 9.8 min | GPU only |
 
-![Detailed comparison](examples/skrub_comparison.png)
+![Bar chart comparison](examples/scaling_comparison.png)
+
+**Key insight:** GPU has overhead at tiny scale but wins at 5k+ unique strings. Beyond 20k unique, skrub crashes entirely while cu-cat GPU continues scaling to 1M+ unique strings.
 
 dirty_cat (the predecessor) has not been updated for pandas ≥2.2.
 
