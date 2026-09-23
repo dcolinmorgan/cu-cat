@@ -1,44 +1,33 @@
-name: Publish Python 🐍 distributions 📦 to PyPI and TestPyPI
+name: Publish to PyPI
 
 on:
   push:
     tags:
-      - '*'
+      - 'v*'
   workflow_dispatch:
 
 jobs:
-  build-n-publish:
-    name: Build and publish Python 🐍 distributions 📦 to PyPI and TestPyPI
+  publish:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install pypa/build
-        run: python -m pip install build twine
+      - name: Install build tools
+        run: pip install build twine
 
-      - name: Build a binary wheel and a source tarball
+      - name: Build
         run: python -m build
 
-      - name: Check dist
+      - name: Check
         run: twine check dist/*
 
-      - name: Publish distribution 📦 to Test PyPI
-        if: ${{ secrets.PYPI_TEST != '' }}
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TEST }}
-        run: twine upload --repository testpypi dist/* --skip-existing
-        continue-on-error: true
-
-      - name: Publish distribution 📦 to PyPI
+      - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.CUCAT_PYPI }}
