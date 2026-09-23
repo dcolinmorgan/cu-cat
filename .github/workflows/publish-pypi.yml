@@ -10,9 +10,6 @@ jobs:
   build-n-publish:
     name: Build and publish Python 🐍 distributions 📦 to PyPI and TestPyPI
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -25,18 +22,24 @@ jobs:
           python-version: '3.10'
 
       - name: Install pypa/build
-        run: python -m pip install -e .[build]
+        run: python -m pip install build twine
 
       - name: Build a binary wheel and a source tarball
-        run: ./bin/build.sh
+        run: python -m build
+
+      - name: Check dist
+        run: twine check dist/*
 
       - name: Publish distribution 📦 to Test PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          skip-existing: true
+        if: ${{ secrets.PYPI_TEST != '' }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TEST }}
+        run: twine upload --repository testpypi dist/* --skip-existing
+        continue-on-error: true
 
       - name: Publish distribution 📦 to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.CUCAT_PYPI }}
+        run: twine upload dist/* --skip-existing
