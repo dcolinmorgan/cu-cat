@@ -70,16 +70,19 @@ As a rule of thumb, keep `n_unique * hashing_n_features * 24` bytes under your f
 
 Measured on a T4 with a deliberately optimistic budget (1M rows, 200k distinct strings, an estimate claiming 19.5 GB fits in 14 GB): the fit recovers and completes in 31.1s, against 30.3s when the budget is correct from the start.
 
-**Comparison with skrub.** skrub is the maintained successor to dirty_cat. On CPU with matched parameters (50k rows, 5k unique strings, hashing=True):
+**Comparison with skrub.** skrub is the maintained successor to dirty_cat. With matched parameters (hashing=True, n_components=10, max_iter=5):
 
-| | skrub | cu-cat CPU | cu-cat GPU (T4) |
-|---|---|---|---|
-| fit | 7.1s | 3.6s (2.0x) | 8.1s* |
-| transform | 2.5s | 3.3s (0.8x) | 4.8s* |
+![Scaling comparison](examples/scaling_comparison.png)
 
-\* GPU measurements at 1M rows / 50k unique — different scale, not directly comparable. The GPU advantage appears at higher cardinality where CPU becomes memory-bound.
+Key findings:
+- **At low cardinality (<10k unique):** skrub and cu-cat GPU are comparable
+- **At medium cardinality (10-20k unique):** cu-cat GPU is 2-2.5x faster  
+- **At high cardinality (>20k unique):** skrub crashes; cu-cat GPU scales to 400k+ unique strings
+- **cu-cat GPU at 1M rows / 200k unique:** 38s total (where skrub cannot run at all)
 
-dirty_cat (the predecessor) has not been updated for pandas ≥2.2 and fails on the deprecated `'H'` datetime frequency alias.
+![Detailed comparison](examples/skrub_comparison.png)
+
+dirty_cat (the predecessor) has not been updated for pandas ≥2.2.
 
 **`hashing=True` for unbounded cardinality.** The default `CountVectorizer` learns a vocabulary, so it must see all unique strings at once and it freezes that vocabulary on the first `partial_fit` chunk. `HashingVectorizer` (`hashing=True`) is stateless with a fixed `hashing_n_features` width, so it needs no vocabulary pass and stays a constant size no matter how many distinct strings arrive. That makes it the right choice when the number of *distinct* values, not the number of rows, is what exceeds GPU memory.
 
