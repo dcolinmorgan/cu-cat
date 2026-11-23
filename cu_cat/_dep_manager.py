@@ -21,26 +21,31 @@ class DepManager:
         self.pkgs = {}
 
     def __getattr__(self, pkg: str):
-        self._add_deps(pkg)
-        try:
-            return self.pkgs[pkg]
-        except KeyError:
-            return None
+        if pkg not in self.pkgs:
+            self._add_deps(pkg)
+        return self.pkgs.get(pkg)
 
     def _add_deps(self, pkg: str):
         try:
             pkg_val = importlib.import_module(pkg)
-            self.pkgs[pkg] = pkg_val
-            setattr(self, pkg, pkg_val)
-        except:
-            pass
+        except ModuleNotFoundError:
+            # Optional dependency is absent. A broken wheel raises ImportError
+            # (for example pyarrow refusing the installed NumPy) and must not
+            # be swallowed: callers would otherwise see a later AttributeError
+            # on None instead of the real install failure.
+            self.pkgs[pkg] = None
+            return
+        self.pkgs[pkg] = pkg_val
+        setattr(self, pkg, pkg_val)
 
     def import_from(self, pkg: str, name: str):
         try:
             module = __import__(pkg, fromlist=[name])
-            self.pkgs[name] = module
-        except:
-            pass
+        except ModuleNotFoundError:
+            self.pkgs[name] = None
+            return None
+        self.pkgs[name] = module
+        return module
 
 
 deps = DepManager()

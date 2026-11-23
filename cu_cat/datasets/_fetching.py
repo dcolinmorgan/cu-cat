@@ -153,6 +153,11 @@ class DatasetInfoOnly:
     read_csv_kwargs: dict[str, Any]
 
 
+def _missing_or_empty(path: Path) -> bool:
+    """True when ``path`` is absent or a 0-byte placeholder."""
+    return (not path.is_file()) or path.stat().st_size == 0
+
+
 def _fetch_openml_dataset(
     dataset_id: int,
     data_directory: Path | None = None,
@@ -188,42 +193,30 @@ def _fetch_openml_dataset(
     data_directory = data_directory.resolve()
     data_directory.mkdir(parents=True, exist_ok=True)
 
-    # Construct the path to the gzip file containing the details on a dataset.
-    details_gz_path = data_directory / DETAILS_DIRECTORY / f"{dataset_id}.gz"
-    features_gz_path = data_directory / FEATURES_DIRECTORY / f"{dataset_id}.gz"
-
-    if not details_gz_path.is_file() or not features_gz_path.is_file():
-        # If the details file or the features file don't exist,
-        # download the dataset.
-        _download_and_write_openml_dataset(
-            dataset_id=dataset_id, data_directory=data_directory
-        )
-    details = _get_details(details_gz_path)
-
-    # The file ID is required because the data file is named after this ID,
-    # and not after the dataset's.
-    file_id = details.file_id
-    csv_path = data_directory / f"{details.name}.csv"
-
-    data_gz_path = data_directory / DATA_DIRECTORY / f"{file_id}.gz"
-
-    if not data_gz_path.is_file():
-        # double-check.
-        # If the data file does not exist, download the dataset.
-        _download_and_write_openml_dataset(
-            dataset_id=dataset_id, data_directory=data_directory
-        )
-
-    if not csv_path.is_file():
-        # If the CSV file does not exist, use the dataset
-        # downloaded by ``fetch_openml()`` to construct it.
-        features = _get_features(features_gz_path)
-        _export_gz_data_to_csv(data_gz_path, csv_path, features)
+    # sklearn >= 1.4 stores the ARFF gzip as
+    # ``<data_home>/openml/openml.org/data/v1/download/<id>/<name>.arff.gz``,
+    # not ``<id>.gz``. Reading the frame fetch_openml already parsed avoids
+    # that layout, and a 0-byte CSV is rewritten instead of treated as cached.
+    bunch = _download_and_write_openml_dataset(
+        dataset_id=dataset_id, data_directory=data_directory
+    )
+    name = bunch.details["name"]
+    csv_path = data_directory / f"{name}.csv"
+    if _missing_or_empty(csv_path):
+        if csv_path.is_file():
+            csv_path.unlink()
+        frame = bunch.frame
+        if frame is None:
+            raise RuntimeError(
+                f"fetch_openml returned no frame for dataset {dataset_id}."
+            )
+        frame.to_csv(csv_path, index=False)
 
     url = openml_url.format(ID=dataset_id)
+    description = bunch.DESCR if isinstance(bunch.DESCR, str) else str(bunch.DESCR)
 
     return {
-        "description": details.description,
+        "description": description,
         "source": url,
         "path": csv_path.resolve(),
     }
@@ -490,7 +483,7 @@ def _download_and_write_movielens_dataset(dataset_id, data_directory, zip_direct
         raise
 
 
-def _download_and_write_openml_dataset(dataset_id: int, data_directory: Path) -> None:
+def _download_and_write_openml_dataset(dataset_id: int, data_directory: Path):
     """Downloads a dataset from OpenML, taking care of creating the directories.
 
     Parameters
@@ -526,7 +519,7 @@ def _download_and_write_openml_dataset(dataset_id: int, data_directory: Path) ->
                 "parser": "auto",
             }
         )
-    fetch_openml(
+    return fetch_openml(
         data_id=dataset_id,
         data_home=str(data_directory),
         as_frame=True,

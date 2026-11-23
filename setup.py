@@ -6,13 +6,19 @@ import versioneer
 def unique_flatten_dict(d):
   return list(set(sum( d.values(), [] )))
 
+# numpy 2 and pyarrow>=16 import together. pyarrow 26 (and every release
+# since 16) refuses to import on NumPy 1.x, which is what an upper pin on
+# scikit-learn 1.3 pulls in. scikit-learn and scipy are imported while the
+# package loads, so they belong here rather than only in an extra.
 core_requires = [
-  'numpy',
-  'pandas',
+  'numpy>=2',
+  'pandas>=2.0',
   'setuptools',
   'typing-extensions',
-  'pyarrow>=0.15.0',
+  'pyarrow>=16',
   'psutil',
+  'scikit-learn>=1.4',
+  'scipy>=1.10',
 ]
 
 stubs = [
@@ -29,10 +35,12 @@ dev_extras = {
 }
 
 base_extras_light = {
+  # dirty-cat 0.4.2 is unmaintained (it moved to skrub). It is not part of
+  # the runtime dependency set: its DatetimeEncoder still floors with the
+  # pandas alias "H", and its check_input still passes force_all_finite.
   'dirty-cat': [
     'dirty-cat',
-    'scipy',
-    'scikit-learn<=1.3.2',]
+  ]
 }
 
 base_extras_heavy = {
