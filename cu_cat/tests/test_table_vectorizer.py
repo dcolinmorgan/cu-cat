@@ -8,17 +8,58 @@ from sklearn.preprocessing import StandardScaler
 
 from sklearn.utils.validation import check_is_fitted
 
+from sklearn import __version__ as sklearn_version
+
+from cu_cat._datetime_encoder import DatetimeEncoder
 from cu_cat._gap_encoder import GapEncoder
 from cu_cat._table_vectorizer import TableVectorizer
 from cu_cat._dep_manager import deps
-dirty_cat = deps.dirty_cat
+from cu_cat._utils import parse_version
+try:
+    # Installed-but-incompatible: dirty-cat 0.4.2 imports
+    # sklearn.utils.fixes._parse_version, which scikit-learn 1.9 removed.
+    # That is an ImportError, not a missing module, and DepManager lets it
+    # surface. The comparisons below stay skipped.
+    dirty_cat = deps.dirty_cat
+except ImportError:
+    dirty_cat = None
 
 
 MSG_PANDAS_DEPRECATED_WARNING = "Skip deprecation warning"
 
+
+def _dirty_cat_unusable() -> bool:
+    """dirty-cat 0.4.2 does not run on the stack pip now resolves.
+
+    Checked against the installed dirty-cat 0.4.2 sources:
+
+    * Importing it on scikit-learn 1.9 raises ImportError:
+      ``sklearn.utils.fixes._parse_version`` is gone (it already left
+      ``sklearn.utils.parse_version`` in 1.7).
+    * ``DatetimeEncoder.fit`` floors with the pandas alias ``"H"``
+      (``WORD_TO_ALIAS["hour"]``). pandas 2.2 warns; pandas 3.0 rejects it.
+    * ``check_input`` still passes ``force_all_finite``, which scikit-learn
+      1.8 removed. Python 3.11 and 3.12 resolve scikit-learn 1.8+.
+
+    The four comparisons also download remote CSVs and, except
+    ``test_small_news``, assert that cu-cat is faster. That is a timing
+    check, so leaving them skipped is the CI-stable result. Unskipping
+    would need a maintained dirty-cat (skrub) and offline fixtures.
+    """
+    if dirty_cat is None:
+        return True
+    pandas_breaks = parse_version(pd.__version__) >= parse_version("2.2")
+    sklearn_breaks = parse_version(sklearn_version) >= parse_version("1.8")
+    return pandas_breaks or sklearn_breaks
+
+
 requires_dirty_cat = pytest.mark.skipif(
-    dirty_cat is None or pd.__version__ >= "2.2",
-    reason="dirty_cat not installed or broken on pandas >= 2.2 (deprecated 'H' freq)"
+    _dirty_cat_unusable(),
+    reason=(
+        "dirty-cat 0.4.2 does not import on scikit-learn>=1.7 "
+        "(_parse_version removed), floors datetimes with pandas alias 'H', "
+        "and passes force_all_finite"
+    ),
 )
 
 
@@ -211,40 +252,19 @@ def test_get_feature_names_out() -> None:
     vec_w_pass = TableVectorizer(remainder="passthrough")
     vec_w_pass.fit(X)
 
-    # In this test, order matters. If it doesn't, convert to set.
-    expected_feature_names_pass = np.array(
-        [
-            "int",
-            "float",
-            "str1_public",
-            "str2_chef",
-            "str2_lawyer",
-            "str2_manager",
-            "str2_officer",
-            "str2_teacher",
-            "cat1_yes",
-            "cat2_20K+",
-            "cat2_30K+",
-            "cat2_40K+",
-            "cat2_50K+",
-            "cat2_60K+",
-        ]
-    )
-    assert len(vec_w_pass.get_feature_names_out()) >= len(expected_feature_names_pass)
-
-    vec_w_drop = TableVectorizer(remainder="drop")
-    vec_w_drop.fit(X)
-
-    # In this test, order matters. If it doesn't, convert to set.
-    expected_feature_names_drop = [
+    # Order matters: numeric columns, then each low-cardinality column's
+    # categories in sorted order. Comparing lengths hid the padded names.
+    expected_feature_names = [
         "int",
         "float",
+        "str1_private",
         "str1_public",
         "str2_chef",
         "str2_lawyer",
         "str2_manager",
         "str2_officer",
         "str2_teacher",
+        "cat1_no",
         "cat1_yes",
         "cat2_20K+",
         "cat2_30K+",
@@ -252,7 +272,69 @@ def test_get_feature_names_out() -> None:
         "cat2_50K+",
         "cat2_60K+",
     ]
-    assert len(vec_w_drop.get_feature_names_out()) >= len(expected_feature_names_drop)
+    assert list(vec_w_pass.get_feature_names_out()) == expected_feature_names
+
+    vec_w_drop = TableVectorizer(remainder="drop")
+    vec_w_drop.fit(X)
+    assert list(vec_w_drop.get_feature_names_out()) == expected_feature_names
+
+
+def test_short_object_categories_are_not_zero_padded() -> None:
+    """yes/no must stay yes/no. rjust(4) used to emit 00no and 0yes."""
+    X = pd.DataFrame(
+        {
+            "yesno": ["yes", "no", "yes", "no", "yes"],
+            "num": [1, 2, 3, 4, 5],
+        }
+    )
+    vec = TableVectorizer()
+    vec.fit(X)
+    names = list(vec.get_feature_names_out())
+    assert "yesno_yes" in names
+    assert "yesno_no" in names
+    assert not any(name.startswith("yesno_0") for name in names)
+
+
+def test_datetime_passthrough_without_cudf() -> None:
+    """CPU fit_transform must not call cudf.concat for a datetime column."""
+    X = pd.DataFrame(
+        {
+            "when": pd.to_datetime(
+                ["2020-01-02", "2021-06-15", "2022-03-03", "2019-12-31"]
+            ),
+            "city": ["paris", "lyon", "paris", "nice"],
+        }
+    )
+    vec = TableVectorizer(cardinality_threshold=10)
+    out = vec.fit_transform(X)
+    assert isinstance(out, pd.DataFrame)
+    assert out.shape[0] == 4
+    assert out.shape[1] >= 4
+    assert any(pd.api.types.is_datetime64_any_dtype(out[col]) for col in out.columns)
+    assert "datetime" not in [name for name, _, _ in vec.transformers_]
+
+
+def test_datetime_transformer_argument_is_honored() -> None:
+    X = pd.DataFrame(
+        {
+            "when": pd.to_datetime(
+                ["2020-01-02", "2021-06-15", "2022-03-03", "2019-12-31"]
+            ),
+            "city": ["paris", "lyon", "paris", "nice"],
+        }
+    )
+    vec = TableVectorizer(
+        cardinality_threshold=10,
+        datetime_transformer=DatetimeEncoder(extract_until="year"),
+    )
+    vec.fit(X)
+    assert any(name == "datetime" for name, _, _ in vec.transformers_)
+    names = [str(name) for name in vec.get_feature_names_out()]
+    assert any(name.endswith("_year") for name in names)
+    transformed = np.asarray(vec.transform(X), dtype=float)
+    assert transformed.shape[0] == 4
+    present = set(np.round(transformed[np.isfinite(transformed)]).astype(int))
+    assert {2019, 2020, 2021, 2022} <= present
 
 
 def test_fit() -> None:

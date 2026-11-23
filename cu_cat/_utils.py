@@ -4,6 +4,7 @@ import collections
 from typing import Any, Hashable
 from inspect import getmodule
 import numpy as np
+from sklearn import __version__ as sklearn_version
 from sklearn.utils import check_array
 from ._dep_manager import deps
 import subprocess as sp
@@ -51,38 +52,53 @@ class LRUDict:
         return key in self.cache
 
 
+def _finite_check_kwargs():
+    """Keyword ``check_array`` accepts for non-finite values.
+
+    scikit-learn 1.6 renamed ``force_all_finite`` to ``ensure_all_finite``.
+    1.8 removed the old name, so passing it on a current install is a TypeError.
+    """
+    if parse_version(sklearn_version) < parse_version("1.6"):
+        return {"force_all_finite": False}
+    return {"ensure_all_finite": False}
+
+
+def _check_array(X):
+    return check_array(
+        X,
+        dtype=None,
+        ensure_2d=True,
+        **_finite_check_kwargs(),
+    )
+
+
 def check_input(X) -> np.ndarray:
     """
     Check input with sklearn standards.
     Also converts X to a numpy array if not already.
+
+    ``inspect.getmodule`` on an ndarray instance is ``None`` (the instance
+    does not expose ``__module__``), so a module-name check never sees numpy
+    and the frame branch then swallows ``AttributeError`` from ``.iloc``.
     """
-    # TODO check for weird type of input to pass scikit learn tests
-    #  without messing with the original type too much
-    if 'numpy' in str(getmodule(X)):
-        X_ = check_array(
-            X,
-            dtype=None,
-            ensure_2d=True,
-            force_all_finite=False,
-        )
+    if isinstance(X, np.ndarray):
+        # check_array(ensure_2d=True) rejects a 1-d array instead of
+        # reshaping it. Promote a single feature so the validator runs.
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        X_ = _check_array(X)
         # If the array contains both NaNs and strings, convert to object type
-        if X_.dtype.kind in {"U", "S"}:  # contains strings
-            if np.any(X_ == "nan"):  # missing value converted to string
-                return check_array(
-                    np.array(X, dtype=object),  # had been using cp here, but not necessary
-                    dtype=None,
-                    ensure_2d=True,
-                    force_all_finite=False,
-                )
-    if 'numpy' not in str(getmodule(X)):
+        if X_.dtype.kind in {"U", "S"} and np.any(X_ == "nan"):
+            return _check_array(np.array(X, dtype=object))
+        return X_
+
+    if cudf is not None and hasattr(X, "iloc"):
         for k in range(X.shape[1]):
             try:
-                X.iloc[:,k] = cudf.to_numeric(X.iloc[:,k], downcast='float').to_cupy()
-            except:
+                X.iloc[:, k] = cudf.to_numeric(X.iloc[:, k], downcast="float").to_cupy()
+            except Exception:
                 pass
-        X_ = X
-    
-    return X_
+    return X
 
 def df_type(df):
     """

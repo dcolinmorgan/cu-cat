@@ -153,6 +153,11 @@ class DatasetInfoOnly:
     read_csv_kwargs: dict[str, Any]
 
 
+def _missing_or_empty(path: Path) -> bool:
+    """True when ``path`` is absent or a 0-byte placeholder."""
+    return (not path.is_file()) or path.stat().st_size == 0
+
+
 def _fetch_openml_dataset(
     dataset_id: int,
     data_directory: Path | None = None,
@@ -207,16 +212,18 @@ def _fetch_openml_dataset(
 
     data_gz_path = data_directory / DATA_DIRECTORY / f"{file_id}.gz"
 
-    if not data_gz_path.is_file():
-        # double-check.
-        # If the data file does not exist, download the dataset.
+    if _missing_or_empty(data_gz_path):
+        # A 0-byte file is not a finished download. Parallel tests used to
+        # treat it as cached and then parse nothing.
+        if data_gz_path.is_file():
+            data_gz_path.unlink()
         _download_and_write_openml_dataset(
             dataset_id=dataset_id, data_directory=data_directory
         )
 
-    if not csv_path.is_file():
-        # If the CSV file does not exist, use the dataset
-        # downloaded by ``fetch_openml()`` to construct it.
+    if _missing_or_empty(csv_path):
+        if csv_path.is_file():
+            csv_path.unlink()
         features = _get_features(features_gz_path)
         _export_gz_data_to_csv(data_gz_path, csv_path, features)
 

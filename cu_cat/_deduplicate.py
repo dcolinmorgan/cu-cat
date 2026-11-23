@@ -129,7 +129,7 @@ def deduplicate(
     method: Literal[
         "single", "complete", "average", "centroid", "median", "ward"
     ] = "average",
-) -> List[str]:
+) -> pd.Series:
     """Deduplicate data by hierarchically clustering similar strings.
 
     Parameters
@@ -158,8 +158,8 @@ def deduplicate(
 
     Returns
     -------
-    List[str]
-       The deduplicated data.
+    pandas.Series
+       The deduplicated values, indexed by the original spellings.
 
     See Also
     --------

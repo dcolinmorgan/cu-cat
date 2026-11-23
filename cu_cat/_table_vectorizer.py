@@ -20,6 +20,7 @@ from sklearn.utils.deprecation import deprecated
 from sklearn.utils.validation import check_is_fitted
 
 from ._gap_encoder import GapEncoder, make_safe_gpu_dataframes  # type: ignore
+from ._datetime_encoder import DatetimeEncoder
 from ._dep_manager import deps
 from ._utils import parse_version, df_type, _transform_one  # type: ignore
 
@@ -227,6 +228,34 @@ class _OnHost(TransformerMixin, BaseEstimator):
 
     def get_feature_names_out(self, input_features=None):
         return self.transformer.get_feature_names_out(input_features)
+
+
+def _concat_encoded(encoded, extra):
+    """Append ``extra`` columns to an encoded block.
+
+    The CPU path has no cuDF. Calling ``cudf.concat`` there is an
+    AttributeError on None. pandas is used unless both sides are already
+    cuDF frames.
+    """
+    cudf_mod = deps.cudf
+    both_cudf = (
+        cudf_mod is not None
+        and isinstance(encoded, cudf_mod.DataFrame)
+        and isinstance(extra, cudf_mod.DataFrame)
+    )
+    if both_cudf:
+        return cudf_mod.concat([encoded, extra], axis=1, ignore_index=True)
+
+    def _as_pandas(part):
+        if isinstance(part, pd.DataFrame):
+            return part.reset_index(drop=True)
+        if hasattr(part, "to_pandas"):
+            return part.to_pandas().reset_index(drop=True)
+        return pd.DataFrame(np.asarray(part))
+
+    return pd.concat(
+        [_as_pandas(encoded), _as_pandas(extra)], axis=1, ignore_index=True
+    )
 
 
 def _wrap_if_cpu_only(transformer, engine):
@@ -485,7 +514,7 @@ class TableVectorizer(ColumnTransformer):
         self.low_card_cat_transformer = low_card_cat_transformer
         self.high_card_cat_transformer = high_card_cat_transformer
         self.numerical_transformer = numerical_transformer
-        self.datetime_transformer = "passthrough"
+        self.datetime_transformer = datetime_transformer
         self.auto_cast = auto_cast
         self.impute_missing = impute_missing
         self.output_type = output_type
@@ -540,7 +569,14 @@ class TableVectorizer(ColumnTransformer):
         else:
             self.numerical_transformer_ = self.numerical_transformer
 
-        self.datetime_transformer_ = "passthrough" # self.datetime_transformer
+        if isinstance(self.datetime_transformer, sklearn.base.TransformerMixin):
+            self.datetime_transformer_ = clone(self.datetime_transformer)
+        elif self.datetime_transformer is None:
+            self.datetime_transformer_ = DatetimeEncoder()
+        elif self.datetime_transformer == "remainder":
+            self.datetime_transformer_ = self.remainder
+        else:
+            self.datetime_transformer_ = self.datetime_transformer
 
         # Anything scikit-learn-only needs host data when we run on GPU.
         engine = "cuml" if deps.cudf else "pandas"
@@ -549,6 +585,9 @@ class TableVectorizer(ColumnTransformer):
         )
         self.numerical_transformer_ = _wrap_if_cpu_only(
             self.numerical_transformer_, engine
+        )
+        self.datetime_transformer_ = _wrap_if_cpu_only(
+            self.datetime_transformer_, engine
         )
 
         # TODO: check that the provided transformers are valid
@@ -588,11 +627,14 @@ class TableVectorizer(ColumnTransformer):
                 continue
             except (ValueError, TypeError):
                 pass
-            X[i] = X[i].replace('nan',np.nan).fillna('0o0o0')
-            # object cols may hold non-strings (e.g. after .astype(object)),
-            # so cast before using the .str accessor
-            X[i] = X[i].astype(str).str.rjust(4,'0')
-            # X[i] = X[i].str.replace('.', 'dot', regex=False) #for IP addresses
+            # Uniform strings, without padding. np.nan is a float, so an
+            # object column of categories plus missing values is mixed
+            # float/str and OneHotEncoder refuses it. astype(str) keeps
+            # "yes"/"no" as themselves. The old rjust(4, "0") turned them
+            # into "0yes"/"00no" on CPU and GPU alike. GapEncoder still pads
+            # a copy inside the n-gram call when the device needs a minimum
+            # length; that copy is not the one-hot vocabulary.
+            X[i] = X[i].astype(str)
 
         num_col = X.select_dtypes(include=['int64','float64']).columns
         for i in num_col:
@@ -814,18 +856,26 @@ class TableVectorizer(ColumnTransformer):
         if 'cudf' not in str(getmodule(X)) and deps.cudf:
         # if deps.cudf and 'cudf' not in str(getmodule(X)):
             X = cudf.from_pandas(X)#,nan_as_null=True) ### see how flag acts
+        # Only numeric columns. fillna(0.0) on pandas string dtype warns now
+        # and will raise in a later pandas; categories must stay categories.
         try:
-            X.fillna(0.0,inplace=True)
-        except:
-            pass
+            numeric_columns_now = X.select_dtypes(include=["number"]).columns
+            if len(numeric_columns_now):
+                X[numeric_columns_now] = X[numeric_columns_now].fillna(0.0)
+        except Exception:
+            try:
+                X.fillna(0.0, inplace=True)
+            except Exception:
+                pass
         X, y = make_safe_gpu_dataframes(X, None, self.engine_)
         
         if (self.datetime_transformer_ == "passthrough") and (datetime_columns !=[]):
             Z = X.drop(columns=datetime_columns)
             X_enc = super().fit_transform(Z, y)
-        elif 'cudf' not in str(getmodule(X)):
-            X_enc = super().fit_transform(X.astype(str), y)
         else:
+            # Keep dtypes. Stringifying the whole frame made numeric columns
+            # look like text and turned datetimes into strings before
+            # DatetimeEncoder could read them.
             X_enc = super().fit_transform(X, y)
         if deps.cudf and 'cudf' not in str(getmodule(X)):
             X_enc = cudf.DataFrame(X_enc)
@@ -840,8 +890,8 @@ class TableVectorizer(ColumnTransformer):
                 cols: List[int]  # type: ignore
                 self.transformers_[i] = (name, enc, [self.columns_[j] for j in cols])
 
-        if (self.datetime_transformer_ == "passthrough") & (datetime_columns != []):
-            X_enc = cudf.concat([X_enc, X[datetime_columns]], axis=1, ignore_index=True)
+        if (self.datetime_transformer_ == "passthrough") and (datetime_columns != []):
+            X_enc = _concat_encoded(X_enc, X[datetime_columns])
 
         return X_enc
 

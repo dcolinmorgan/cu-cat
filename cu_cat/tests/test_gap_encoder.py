@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
 
 from cu_cat import GapEncoder, TableVectorizer
@@ -164,16 +165,33 @@ def test_get_feature_names_out_redundent():
 
 def test_check_fitted_gap_encoder():
     """Test that calling transform before fit raises an error"""
-    import pandas as pd
-    from cu_cat import GapEncoder
     X = pd.DataFrame(np.array([["alice"], ["bob"]]))
     enc = GapEncoder(n_components=2, random_state=42)
-    # with pytest.raises(NotFittedError):
-        # enc.transform(X)
+    with pytest.raises(NotFittedError):
+        enc.transform(X)
 
     # Check that it works after fit
     enc.fit(X)
     enc.transform(X)
+
+
+def test_numpy_input_learns_columns_and_transforms():
+    """ndarray columns are encoded, not rows, and transform does not need iloc."""
+    X = np.array([
+        ["alpha one", "RIGHT"],
+        ["beta two", "RIGHT"],
+        ["gamma three", "RIGHT"],
+        ["delta four", "RIGHT"],
+    ])
+    enc = GapEncoder(n_components=2, max_iter=1, hashing=True, random_state=0)
+    enc.fit(X)
+    keys0 = {str(key) for key in enc.fitted_models_[0].H_dict_}
+    keys1 = {str(key) for key in enc.fitted_models_[1].H_dict_}
+    assert keys0 == {"alpha one", "beta two", "gamma three", "delta four"}
+    assert keys1 == {"RIGHT"}
+    transformed = to_host(enc.transform(X))
+    assert transformed.shape == (X.shape[0], enc.n_components * X.shape[1])
+    assert np.isfinite(transformed).all()
 
 
 def test_small_sample():
@@ -324,15 +342,51 @@ def test_transform_encodes_unseen_categories():
 
 
 def test_update_block_splits_on_out_of_memory(monkeypatch):
-    """A block that exhausts memory is halved rather than failing the fit."""
+    """A block that exhausts memory is halved rather than failing the fit.
+
+    The split must keep the activations returned for both halves. Reading
+    ``unq_H`` back after the recursive call used to splice the stale first
+    half onto an updated second half.
+    """
     import cu_cat._gap_encoder as ge
 
     enc = GapEncoder(n_components=3, max_iter=2, random_state=0, hashing=True)
     enc.fit(generate_data(40, random_state=0))
     col = enc.fitted_models_[0]
+    col.batch_size = 2
+
+    words = pd.Series(["aaaa bbbb", "cccc dddd", "eeee ffff", "gggg hhhh",
+                       "iiii jjjj", "kkkk llll", "mmmm nnnn", "oooo pppp"])
+    words, _ = ge.make_safe_gpu_dataframes(words, None, col.engine)
+    unq_V = col.ngrams_count_.transform(words)
+    xp = ge.cp if (ge.cp is not None and "cupy" in ge.df_type(col.W_)) else np
+    real = ge._multiplicative_update_h_smallfast
+    saved = (col.W_.copy(), col.A_.copy(), col.B_.copy())
+
+    def run_half(sl, H_init):
+        H_new = real(
+            unq_V[sl],
+            col.W_,
+            H_init,
+            epsilon=1e-3,
+            max_iter=col.max_iter_e_step,
+            rescale_W=col.rescale_W,
+            gamma_shape_prior=col.gamma_shape_prior,
+            gamma_scale_prior=col.gamma_scale_prior,
+        )
+        ge._multiplicative_update_w_smallfast(
+            unq_V[sl], col.W_, col.A_, col.B_, H_new, col.rescale_W, col.rho_,
+        )
+        return np.asarray(to_host(H_new))
+
+    ones = np.ones((8, col.n_components))
+    expected = np.vstack([
+        run_half(slice(0, 4), ones[:4].copy()),
+        run_half(slice(4, 8), ones[4:].copy()),
+    ])
+    col.W_, col.A_, col.B_ = saved
 
     widths = []
-    real = ge._multiplicative_update_h_smallfast
 
     def flaky(Vt, W, Ht, **kw):
         widths.append(Vt.shape[0])
@@ -341,18 +395,103 @@ def test_update_block_splits_on_out_of_memory(monkeypatch):
         return real(Vt, W, Ht, **kw)
 
     monkeypatch.setattr(ge, "_multiplicative_update_h_smallfast", flaky)
-    col.batch_size = 2
-
-    words = pd.Series(["aaaa bbbb", "cccc dddd", "eeee ffff", "gggg hhhh",
-                       "iiii jjjj", "kkkk llll", "mmmm nnnn", "oooo pppp"])
-    words, _ = ge.make_safe_gpu_dataframes(words, None, col.engine)
-    unq_V = col.ngrams_count_.transform(words)
-    xp = ge.cp if (ge.cp is not None and "cupy" in ge.df_type(col.W_)) else np
     unq_H = xp.ones((8, col.n_components))
     out = col._update_block(unq_V, unq_H, slice(0, 8), 8)
 
     assert out.shape == (8, col.n_components)
     assert max(widths) == 8 and min(widths) <= 4  # tried wide, fell back narrow
+    np.testing.assert_allclose(to_host(out), expected, rtol=1e-6, atol=1e-6)
+
+
+def test_early_stopping_uses_cupy_norm_not_cp_module(monkeypatch):
+    """Early stopping must not import a module named ``cp``.
+
+    ``deps.cp`` is ``import cp``, which does not exist, so the CuPy norm
+    never ran. The change is computed with ``deps.cupy`` when that imports.
+    """
+    import cu_cat._dep_manager as dm
+    import cu_cat._gap_encoder as ge
+
+    real_import = dm.importlib.import_module
+
+    def guarded(name, *args, **kwargs):
+        if name == "cp":
+            raise AssertionError(
+                "early stopping imported 'cp'; CuPy's module is 'cupy'"
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(dm.importlib, "import_module", guarded)
+    GapEncoder(
+        n_components=2, max_iter=1, random_state=0, hashing=True
+    ).fit(generate_data(12, random_state=0))
+
+    calls = []
+
+    class _Linalg:
+        def norm(self, value):
+            calls.append("norm")
+            return np.linalg.norm(np.asarray(value))
+
+    class _FakeCuPy:
+        linalg = _Linalg()
+
+        def multiply(self, left, right):
+            calls.append("multiply")
+            return np.multiply(left, right)
+
+        def reciprocal(self, value):
+            return np.reciprocal(np.asarray(value, dtype=float))
+
+    monkeypatch.setattr(ge.deps, "cupy", _FakeCuPy(), raising=False)
+    change = ge._relative_change(np.eye(2), np.eye(2) * 0.5)
+    assert calls[:3] == ["norm", "norm", "multiply"]
+    assert np.isfinite(change)
+
+
+def test_chunked_transform_uses_max_iter_e_step(monkeypatch):
+    """Chunked transform uses the same E-step cap as the in-memory path."""
+    import cu_cat._gap_encoder as ge
+
+    enc = GapEncoder(
+        n_components=2, max_iter=1, max_iter_e_step=7, random_state=0, hashing=True,
+    )
+    enc.fit(generate_data(12, random_state=0))
+    col = enc.fitted_models_[0]
+    seen = []
+    real = ge._multiplicative_update_h_smallfast
+
+    def spy(Vt, W, Ht, **kwargs):
+        seen.append(kwargs.get("max_iter"))
+        return real(Vt, W, Ht, **kwargs)
+
+    monkeypatch.setattr(ge, "_multiplicative_update_h_smallfast", spy)
+    monkeypatch.setattr(col, "_plan_updates", lambda sh, sw: (False, 2))
+    col.transform(pd.Series(["aaaa bbbb", "cccc dddd", "eeee ffff", "gggg hhhh"]))
+    assert seen
+    assert set(seen) == {7}
+
+
+def test_resolve_engine_sklearn_when_cudf_imported(monkeypatch):
+    """An explicit sklearn engine is the CPU path even if cuDF imported."""
+    import cu_cat._gap_encoder as ge
+
+    monkeypatch.setattr(ge.deps, "cudf", object(), raising=False)
+    monkeypatch.setattr(ge.deps, "cupy", object(), raising=False)
+    monkeypatch.setattr(ge.deps, "cupyx", object(), raising=False)
+    monkeypatch.setattr(ge.deps, "cuml", object(), raising=False)
+    assert ge.resolve_engine("sklearn")[0] == "sklearn"
+
+
+def test_resolve_engine_falls_back_when_cupy_missing(monkeypatch):
+    import cu_cat._gap_encoder as ge
+
+    monkeypatch.setattr(ge.deps, "cudf", object(), raising=False)
+    monkeypatch.setattr(ge.deps, "cupy", None, raising=False)
+    monkeypatch.setattr(ge.deps, "cupyx", None, raising=False)
+    monkeypatch.setattr(ge.deps, "cuml", None, raising=False)
+    assert ge.resolve_engine("auto")[0] == "sklearn"
+    assert ge.resolve_engine("cuml")[0] == "sklearn"
 
 
 def test_update_block_reports_levers_when_it_cannot_shrink():

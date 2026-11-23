@@ -122,33 +122,76 @@ def _unique_strings(X, engine, return_lookup=False):
     return np.unique(X.astype(str)), None
 
 
+def _cpu_engine():
+    sklearn = deps.sklearn
+    from scipy import sparse
+    from scipy.sparse import csr_matrix as csr
+    np = deps.numpy
+    pandas = deps.pandas
+    return ('sklearn', sklearn, np, csr, sparse, pandas)
+
+
+def _gpu_engine():
+    """Return the cuML engine tuple, or None when the RAPIDS stack is incomplete."""
+    cuml = deps.cuml
+    cp_mod = deps.cupy
+    cudf_mod = deps.cudf
+    cupyx_ = deps.cupyx
+    if not (cuml and cp_mod and cudf_mod and cupyx_):
+        return None
+    try:
+        from cupyx.scipy import sparse
+        from cupyx.scipy.sparse import csr_matrix as csr
+    except ImportError:
+        return None
+    cuml.set_global_output_type('cupy')
+    return ('cuml', cuml, cp_mod, csr, sparse, cudf_mod)
+
+
 def resolve_engine(
     engine: Engine,
 ) -> EngineConcrete:  # noqa
-    if deps.cudf and engine in ["auto", None, "cuml"]:
-    # if engine == 'auto':
-        cuml = deps.cuml  ## for cuml to run gap_encoder, following need to be loaded
-        cp = deps.cupy
-        cudf = deps.cudf
-        cupyx_ = deps.cupyx
-        if cupyx_:
-            from cupyx.scipy import sparse
-            from cupyx.scipy.sparse import csr_matrix as csr
-            cuml.set_global_output_type('cupy')
-            return 'cuml',cuml,cp,csr,sparse,cudf
-    if not deps.cudf and engine in ["auto", None, "sklearn"]: 
-        sklearn = deps.sklearn
-        from scipy import sparse
-        from scipy.sparse import csr_matrix as csr
-        np = deps.numpy
-        pandas = deps.pandas
-        return 'sklearn',sklearn,np,csr,sparse,pandas
+    """Pick cuml or sklearn.
 
-
+    ``engine="sklearn"`` is honored even when cuDF imported. ``auto`` (and an
+    explicit ``cuml`` whose cupy/cupyx import failed) falls back to sklearn,
+    which is the CPU path the rest of the library already runs.
+    """
+    if engine in ("sklearn", "pandas", "cpu"):
+        return _cpu_engine()
+    if engine in ("auto", None, "cuml"):
+        gpu = _gpu_engine()
+        if gpu is not None:
+            return gpu
+        return _cpu_engine()
     raise ValueError(  # noqa
-        f'engine expected to be "auto", '
-        '"sklearn", or  "cuml" '
-        f"but received: {engine} :: {type(engine)}"
+        'engine expected to be "auto", "sklearn", or "cuml" '
+        f"but received: {engine!r} :: {type(engine)}"
+    )
+
+
+def _column_values(X, k):
+    """Column ``k`` of a dataframe or a 2-d ndarray.
+
+    ``X[k]`` on an ndarray is row ``k`` and does not raise, so it cannot be
+    used as the signal to switch to ``iloc``.
+    """
+    if isinstance(X, np.ndarray):
+        return X[:, k]
+    return X.iloc[:, k]
+
+
+def _relative_change(current, previous):
+    """Relative norm of the last topic update.
+
+    CuPy's module is ``cupy``. Looking up ``deps.cp`` imports a module named
+    ``cp``, which does not exist, so the numpy branch used to run on device
+    arrays whenever early stopping actually stayed on GPU.
+    """
+    xp = deps.cupy if deps.cupy is not None else np
+    return xp.multiply(
+        xp.linalg.norm(current - previous),
+        xp.reciprocal(xp.linalg.norm(previous)),
     )
 
 class GapEncoderColumn(TransformerMixin, BaseEstimator):
@@ -500,9 +543,13 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                 f"out of memory on a {width}-row block; retrying at {half} rows"
             )
             mid = sl.start + half
-            self._update_block(unq_V, unq_H, slice(sl.start, mid), half)
-            first = unq_H[slice(sl.start, mid)]
-            second = self._update_block(unq_V, unq_H, slice(mid, sl.stop), half)
+            # Keep the activations the recursive calls return. ``unq_H`` is
+            # not written by those calls, so reading it back here would splice
+            # the stale first half onto an updated second half.
+            first = self._update_block(unq_V, unq_H, slice(sl.start, mid), half)
+            second = self._update_block(
+                unq_V, unq_H, slice(mid, sl.stop), width - half
+            )
             xp = cp if (cp is not None and 'cupy' in df_type(second)) else np
             return xp.concatenate([first, second])
 
@@ -610,10 +657,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                     unq_H[sl] = self._update_block(unq_V, unq_H, sl, chunk_rows)
 
             # Compute the norm of the update of W in the last batch
-            if deps.cp:
-                W_change = cp.multiply(cp.linalg.norm(self.W_ - W_last), cp.reciprocal(cp.linalg.norm(W_last)))
-            else:
-                W_change = np.multiply(np.linalg.norm(self.W_ - W_last), np.reciprocal(np.linalg.norm(W_last)))
+            W_change = _relative_change(self.W_, W_last)
             if (W_change < self.tol) and (n_iter_ >= self.min_iter - 1):
                 break  # Stop if the change in W is smaller than the tolerance
         if 'cudf' in df_type(unq_X) :
@@ -870,7 +914,7 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
                     self.W_,
                     unq_H[slc],
                     epsilon=1e-3,
-                    max_iter=100,
+                    max_iter=self.max_iter_e_step,
                     rescale_W=self.rescale_W,
                     gamma_shape_prior=self.gamma_shape_prior,
                     gamma_scale_prior=self.gamma_scale_prior,
@@ -1180,10 +1224,7 @@ class GapEncoder(TransformerMixin, BaseEstimator):
 
             for k in range(X.shape[1]):
                 col_enc = self._create_column_gap_encoder()
-                try:
-                    self.fitted_models_.append(col_enc.fit(X[k]))
-                except KeyError:
-                    self.fitted_models_.append(col_enc.fit(X.iloc[:, k]))
+                self.fitted_models_.append(col_enc.fit(_column_values(X, k)))
         else :
             X = check_input(X)
             X = self._handle_missing(X)
@@ -1191,7 +1232,7 @@ class GapEncoder(TransformerMixin, BaseEstimator):
             for k in range(X.shape[1]):
             # for k in X.columns:
                 col_enc = self._create_column_gap_encoder()
-                self.fitted_models_.append(col_enc.fit(X.iloc[:,k]))#[k]))
+                self.fitted_models_.append(col_enc.fit(_column_values(X, k)))
         return self
 
     def partial_fit(self, X, y=None) -> "GapEncoder":
@@ -1244,7 +1285,7 @@ class GapEncoder(TransformerMixin, BaseEstimator):
                 f"expected {len(self.fitted_models_)}. "
             )
         for k in range(X.shape[1]):
-            self.fitted_models_[k].partial_fit(X.iloc[:, k])
+            self.fitted_models_[k].partial_fit(_column_values(X, k))
         return self
 
     def transform(self, X) -> np.array:
@@ -1283,7 +1324,7 @@ class GapEncoder(TransformerMixin, BaseEstimator):
 
         # else:
         for k in range(X.shape[1]):
-            X_enc.append(self.fitted_models_[k].transform(X.iloc[:,k]))#[k]))
+            X_enc.append(self.fitted_models_[k].transform(_column_values(X, k)))
         X_enc = np.hstack(X_enc)
         return X_enc
 
