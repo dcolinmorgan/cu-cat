@@ -156,7 +156,9 @@ class GapEncoderColumn(TransformerMixin, BaseEstimator):
     """See GapEncoder's docstring."""
 
     rho_: float
-    H_dict_: Dict[pyarrow.StringScalar, np.ndarray]
+    # Quoted: pyarrow is optional at import (DepManager swallows a failed
+    # import) and this annotation is evaluated while the class body runs.
+    H_dict_: Dict["pyarrow.StringScalar", np.ndarray]
 
     def __init__(
         self,
